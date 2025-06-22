@@ -1,6 +1,6 @@
 use anyhow::Result;
 use arti_client::{IsolationToken, StreamPrefs, TorClient, TorClientConfig};
-use bitcoin::Transaction;
+use bitcoin::{Network, Transaction};
 use tx_pigeon::{
     Args, DNS_SEEDS, MAX_CONCURRENT_DELIVERIES, NetworkAddress, crawl_seed_node, deliver_poop_tx,
 };
@@ -8,9 +8,9 @@ use tx_pigeon::{
 use clap::Parser;
 use rand::seq::SliceRandom;
 
+use rust_mempool::MempoolClient;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::{net::lookup_host, sync::Semaphore, task::JoinSet, time::timeout};
-
 use tracing::{error, info};
 
 #[tokio::main]
@@ -18,9 +18,20 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
 
     let args = Args::parse();
-    let tx_hex_string = args.tx;
+    let tx_hex_string = args.tx.clone();
     let tx = bitcoin::consensus::deserialize::<Transaction>(&hex::decode(tx_hex_string)?)?;
     let txid = tx.compute_txid();
+
+    let client = MempoolClient::new(Network::Bitcoin);
+
+    match client.broadcast_transaction(&args.tx.clone()).await {
+        Ok(txid) => {
+            info!("Transaction broadcast successfully! TXID: {}", txid);
+        }
+        Err(e) => {
+            eprintln!("Failed to broadcast transaction: {:?}", e);
+        }
+    }
 
     let mut seed_addrs = Vec::new();
     let mut seed_tasks = JoinSet::new();
