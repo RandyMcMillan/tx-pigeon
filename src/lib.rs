@@ -1,5 +1,5 @@
 use anyhow::Result;
-use arti_client::{IsolationToken, StreamPrefs, TorClient, TorClientConfig};
+use arti_client::{StreamPrefs, TorClient};
 use bitcoin::{
     Transaction,
     consensus::{Decodable, Encodable},
@@ -19,16 +19,12 @@ use sha3::{Digest, Sha3_256};
 use tor_rtcompat::PreferredRuntime;
 
 use std::{
-    collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::lookup_host,
-    sync::Semaphore,
-    task::JoinSet,
     time::timeout,
 };
 

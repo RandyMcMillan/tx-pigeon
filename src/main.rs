@@ -1,41 +1,16 @@
 use anyhow::Result;
 use arti_client::{IsolationToken, StreamPrefs, TorClient, TorClientConfig};
-use bitcoin::{
-    Transaction,
-    consensus::{Decodable, Encodable},
-    io::Cursor,
-    p2p::{
-        Address, Magic, ServiceFlags,
-        address::AddrV2,
-        message::{NetworkMessage, RawNetworkMessage},
-        message_blockdata::Inventory,
-        message_network::VersionMessage,
-    },
-};
+use bitcoin::Transaction;
 use tx_pigeon::{
     Args, DNS_SEEDS, MAX_CONCURRENT_DELIVERIES, NetworkAddress, crawl_seed_node, deliver_poop_tx,
 };
 
-use clap::{Parser, arg, command};
+use clap::Parser;
 use rand::seq::SliceRandom;
-use sha3::{Digest, Sha3_256};
-use tor_rtcompat::PreferredRuntime;
 
-use std::{
-    collections::HashSet,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::lookup_host,
-    sync::Semaphore,
-    task::JoinSet,
-    time::timeout,
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
+use tokio::{net::lookup_host, sync::Semaphore, task::JoinSet, time::timeout};
 
-use data_encoding::BASE32_NOPAD;
 use tracing::{error, info};
 
 #[tokio::main]
