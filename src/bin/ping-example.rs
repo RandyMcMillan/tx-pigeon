@@ -1,7 +1,7 @@
 use std::{error::Error, time::Duration};
 
-use libp2p::futures::StreamExt;
 use futures::prelude::*;
+use libp2p::futures::StreamExt;
 use libp2p::{noise, ping, swarm::SwarmEvent, tcp, yamux, Multiaddr};
 use tracing_subscriber::EnvFilter;
 

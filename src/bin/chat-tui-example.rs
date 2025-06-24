@@ -128,16 +128,16 @@ async fn main() -> Result<()> {
     }
     if let Some(c) = matches.get_one::<bool>("chat") {
         if matches.get_flag("chat") {
-    let global_rt_result = global_rt()
-        .spawn(async move {
-            println!("global_rt async task!");
-            evt_loop(/* add args */).await.unwrap();
-            //evt_loop(input_rx, peer_tx, topic).await.unwrap();
-            String::from("global_rt async task!");
-            chat().await.expect("")
-        })
-        .await;
-    println!("global_rt_result={:?}", global_rt_result?);
+            let global_rt_result = global_rt()
+                .spawn(async move {
+                    println!("global_rt async task!");
+                    evt_loop(/* add args */).await.unwrap();
+                    //evt_loop(input_rx, peer_tx, topic).await.unwrap();
+                    String::from("global_rt async task!");
+                    chat().await.expect("")
+                })
+                .await;
+            println!("global_rt_result={:?}", global_rt_result?);
             println!("Value for --chat: {c}");
             terminal::ui_driver(config).await;
             assert_eq!(matches.get_flag("tui"), true);
