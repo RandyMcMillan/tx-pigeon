@@ -16,8 +16,6 @@ struct MyBehaviour {
 
 //#[tokio::main]
 pub async fn chat() -> Result<(), Box<dyn Error>> {
-
-
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
         .try_init();
@@ -112,4 +110,4 @@ pub async fn chat() -> Result<(), Box<dyn Error>> {
             }
         }
     }
-    }
+}
