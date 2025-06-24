@@ -28,6 +28,8 @@ struct Args {
     tui: bool,
     #[arg(long = "cfg", default_value = "")]
     config: String,
+    #[arg(long = "tx", default_value = "")]
+    tx: String,
 }
 
 /// REF: <https://docs.rs/clap/4.5.31/clap/struct.ArgMatches.html#method.subcommand>
@@ -47,7 +49,7 @@ async fn main() -> Result<()> {
         println!("Hello {}!", args.name);
     }
 
-    let cmd = Command::new("MyApp")
+    let cmd = Command::new("tx-pigeon")
         .arg(
             Arg::new("name")
                 .long("name")
@@ -70,9 +72,10 @@ async fn main() -> Result<()> {
                 .short('t')
                 //.required(true)
                 .action(ArgAction::SetTrue)
-                .default_value("false"),
+                .default_value("true"),
         )
         .arg(Arg::new("config").long("cfg").action(ArgAction::Set))
+        .arg(Arg::new("tx").long("tx").action(ArgAction::Set))
         .get_matches();
 
     assert!(cmd.clone().contains_id("tui"));

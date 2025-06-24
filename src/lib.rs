@@ -1,3 +1,4 @@
+pub mod prelude {
 use anyhow::Result;
 use arti_client::{StreamPrefs, TorClient};
 use bitcoin::{
@@ -13,7 +14,7 @@ use bitcoin::{
     },
 };
 
-use clap::{Parser, arg, command};
+//use clap::{Parser, arg, command};
 use rand::seq::SliceRandom;
 use sha3::{Digest, Sha3_256};
 use tor_rtcompat::PreferredRuntime;
@@ -31,7 +32,7 @@ use tokio::{
 use data_encoding::BASE32_NOPAD;
 use tracing::{error, info};
 
-pub mod prelude {
+//pub mod prelude {
     //pub use std::result::Result;
     pub use std::convert::{TryFrom, TryInto};
     pub use std::fmt::{self, Debug, Display};
@@ -51,13 +52,13 @@ pub mod prelude {
     pub mod ui;
     pub mod utils;
     pub use clap::parser::ValueSource;
-    pub use clap::{Arg, ArgAction, ArgMatches, Command, Parser, Subcommand};
-    pub use color_eyre::eyre::{Result, WrapErr};
+    pub use clap::{Arg, ArgAction, ArgMatches, Command, Parser, Subcommand, arg, command};
+    pub use color_eyre::eyre::{Result as EyreResult, WrapErr};
     pub use handlers::config::CompleteConfig;
 
     //
     //
-}
+//}
 
 pub const DNS_SEEDS: &[&str] = &[
     "dnsseed.bluematt.me",
@@ -384,4 +385,5 @@ pub fn tor_v3_onion_from_pubkey(pubkey: &[u8; 32]) -> String {
     addr_raw.push(0x03);
 
     BASE32_NOPAD.encode(&addr_raw).to_lowercase() + ".onion"
+}
 }

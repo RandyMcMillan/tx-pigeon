@@ -22,7 +22,7 @@ use rust_project_template::prelude::*;
 //use anyhow::Result;
 use arti_client::{IsolationToken, StreamPrefs, TorClient, TorClientConfig};
 use bitcoin::{Network, Transaction};
-use rust_project_template::{
+use rust_project_template::prelude::{
     Args, DNS_SEEDS, MAX_CONCURRENT_DELIVERIES, NetworkAddress, crawl_seed_node, deliver_poop_tx,
 };
 
