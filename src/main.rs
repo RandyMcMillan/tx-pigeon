@@ -23,7 +23,7 @@ use rust_project_template::prelude::*;
 use arti_client::{IsolationToken, StreamPrefs, TorClient, TorClientConfig};
 use bitcoin::{Network, Transaction};
 use rust_project_template::prelude::{
-    Args, DNS_SEEDS, MAX_CONCURRENT_DELIVERIES, NetworkAddress, crawl_seed_node, deliver_poop_tx,
+    crawl_seed_node, deliver_poop_tx, NetworkAddress, DNS_SEEDS, MAX_CONCURRENT_DELIVERIES,
 };
 
 //use clap::Parser;
@@ -34,14 +34,85 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::{net::lookup_host, sync::Semaphore, task::JoinSet, time::timeout};
 use tracing::{error, info};
 
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Args {
+    /// Name of the person to greet
+    #[arg(short, long, default_value = "user")]
+    name: String,
+
+    /// Number of times to greet
+    #[arg(short, long, default_value_t = 1)]
+    count: u8,
+    #[arg(short = 't', long, default_value = "true")]
+    tui: bool,
+    #[arg(long = "cfg", default_value = "")]
+    config: String,
+    #[arg(long = "tx", default_value = "")]
+    tx: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
 
     let args = Args::parse();
+
+    for _ in 0..args.count {
+        println!("Hello {}!", args.name);
+    }
+
+    let cmd = Command::new("tx-pigeon")
+        .arg(
+            Arg::new("name")
+                .long("name")
+                .short('n')
+                //.required(true)
+                .action(ArgAction::Set)
+                .default_value("-"),
+        )
+        .arg(
+            Arg::new("count")
+                .long("count")
+                .short('c')
+                //.required(true)
+                .action(ArgAction::Set)
+                .default_value("0"),
+        )
+        .arg(
+            Arg::new("tui")
+                .long("tui")
+                .short('t')
+                //.required(true)
+                .action(ArgAction::SetTrue)
+                .default_value("true"),
+        )
+        .arg(Arg::new("config").long("cfg").action(ArgAction::Set))
+        .arg(Arg::new("tx").long("tx").action(ArgAction::Set))
+        .get_matches();
+
+    assert!(cmd.clone().contains_id("tui"));
+
+    let matches = cmd.clone();
+    assert!(matches.contains_id("tui"));
+
     let tx_hex_string = args.tx.clone();
     let tx = bitcoin::consensus::deserialize::<Transaction>(&hex::decode(tx_hex_string)?)?;
     let txid = tx.compute_txid();
+
+    color_eyre::install().unwrap();
+
+    let config = CompleteConfig::new()
+        .wrap_err("Configuration error.")
+        .unwrap();
+
+    if let Some(c) = matches.get_one::<bool>("tui") {
+        if matches.get_flag("tui") {
+            println!("Value for --tui: {c}");
+            terminal::ui_driver(config).await;
+            assert_eq!(matches.get_flag("tui"), true);
+        }
+    }
 
     let client = MempoolClient::new(Network::Bitcoin);
 
