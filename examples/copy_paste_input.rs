@@ -2,7 +2,7 @@ use anyhow::Result;
 use arti_client::{IsolationToken, StreamPrefs, TorClient, TorClientConfig};
 use bitcoin::{Network, Transaction};
 use rust_project_template::{
-    DNS_SEEDS, MAX_CONCURRENT_DELIVERIES, NetworkAddress, crawl_seed_node, deliver_poop_tx,
+    crawl_seed_node, deliver_poop_tx, NetworkAddress, DNS_SEEDS, MAX_CONCURRENT_DELIVERIES,
 };
 
 use crossterm::input::input;

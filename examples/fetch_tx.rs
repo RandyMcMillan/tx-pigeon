@@ -2,7 +2,7 @@
 use arti_client::{IsolationToken, StreamPrefs, TorClient, TorClientConfig};
 use bitcoin::{Network, Transaction};
 use rust_project_template::{
-    Args, DNS_SEEDS, MAX_CONCURRENT_DELIVERIES, NetworkAddress, crawl_seed_node, deliver_poop_tx,
+    crawl_seed_node, deliver_poop_tx, Args, NetworkAddress, DNS_SEEDS, MAX_CONCURRENT_DELIVERIES,
 };
 
 use clap::Parser;
