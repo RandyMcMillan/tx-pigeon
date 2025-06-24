@@ -13,9 +13,14 @@ use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::{net::lookup_host, sync::Semaphore, task::JoinSet, time::timeout};
 use tracing::{error, info};
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_target(false).init();
+use anyhow::{Context, Result};
+use reqwest::{Client, Response, Error};
+use serde::{Deserialize, Serialize};
+
+// Base URL for the Mempool.space API
+const MEMPOOL_SPACE_API_BASE: &str = "https://mempool.space/api";
+
+async fn fetch_txids()-> Vec<MempoolTransaction> {
 
     // Create an HTTP client
     let client = Client::new();
@@ -25,18 +30,17 @@ async fn main() -> Result<()> {
     println!("Fetching data from: {}", url);
 
     // Make the GET request and get the response
-    let response = client.get(&url).send().await?;
+    let response = client.get(&url).send().await.expect("");
 
-    // Check if the request was successful (HTTP status 200 OK)
     // If not, reqwest::Response::error_for_status() will convert HTTP errors
     // into a reqwest::Error which can be propagated by `?`.
-    let response = response.error_for_status()?;
+    let response = response.error_for_status().expect("");
 
     // Deserialize the JSON response into a Vec of MempoolTransaction structs
     let recent_txs: Vec<MempoolTransaction> = response
         .json()
         .await
-        .context("Failed to parse JSON response from mempool.space")?;
+        .context("Failed to parse JSON response from mempool.space").expect("");
 
     // Print the number of transactions received
     println!(
@@ -44,6 +48,7 @@ async fn main() -> Result<()> {
         recent_txs.len()
     );
 
+	//let txs = Vec<String>;
     // Print details of the first few transactions for demonstration
     for (i, tx) in recent_txs.iter().take(5).enumerate() {
         println!("\n--- Transaction {} ---", i + 1);
@@ -57,6 +62,36 @@ async fn main() -> Result<()> {
     // You can also print the entire JSON structure if you want to inspect it
     // let raw_json: serde_json::Value = serde_json::from_str(&response.text().await?)?;
     // println!("\nRaw JSON response (first 1000 chars):\n{}", &serde_json::to_string_pretty(&raw_json)?[..1000]);
+
+	recent_txs
+
+}
+
+pub async fn get_tx_hex(tx: MempoolTransaction) -> Result<Response, Error> {
+
+
+	//curl -sSL "https://mempool.space/api/tx/15e10745f15593a899cef391191bdd3d7c12412cc4696b7bcb669d0feadc8521/hex"
+    // Create an HTTP client
+    let client = Client::new();
+
+    // Construct the full URL
+    let url = format!("{}/tx/{}", MEMPOOL_SPACE_API_BASE, tx.txid);
+    println!("Fetching data from: {}", url);
+
+    // Make the GET request and get the response
+    let response = client.get(&url).send().await.expect("");
+
+    // Check if the request was successful (HTTP status 200 OK)
+    // If not, reqwest::Response::error_for_status() will convert HTTP errors
+    // into a reqwest::Error which can be propagated by `?`.
+    let response = response.error_for_status()?;
+
+	Ok(response)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    tracing_subscriber::fmt().with_target(false).init();
 
     let args = Args::parse();
     let tx_hex_string = args.tx.clone();
@@ -216,13 +251,6 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-
-use anyhow::{Context, Result};
-use reqwest::Client;
-use serde::{Deserialize, Serialize};
-
-// Base URL for the Mempool.space API
-const MEMPOOL_SPACE_API_BASE: &str = "https://mempool.space/api";
 
 // Struct to represent a single transaction from the /mempool/recent endpoint
 // We only need the fields we care about, based on the API response structure.
