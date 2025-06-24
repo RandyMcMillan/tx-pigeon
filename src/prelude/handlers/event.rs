@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crossterm::event::{self, Event as CEvent, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm_0_26_1::event::{self, Event as CEvent, KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use tokio::{sync::mpsc, time::Instant};
 
 #[allow(dead_code)]

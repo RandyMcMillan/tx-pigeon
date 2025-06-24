@@ -3,7 +3,7 @@ use std::{
     io::{stdout, Stdout, Write},
 };
 
-use crossterm::{
+use crossterm_0_26_1::{
     cursor::{DisableBlinking, EnableBlinking, SetCursorStyle},
     event::{DisableMouseCapture, EnableMouseCapture},
     execute, queue,
