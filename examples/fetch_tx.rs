@@ -11,7 +11,7 @@ use rand::seq::SliceRandom;
 use rust_mempool::MempoolClient;
 use std::{collections::HashSet, sync::Arc, time::Duration};
 use tokio::{net::lookup_host, sync::Semaphore, task::JoinSet, time::timeout};
-use tracing::{error, info};
+use tracing::{error, info, trace, warn};
 
 use anyhow::{Context, Result};
 use reqwest::{Client, Error, Response};
@@ -26,7 +26,7 @@ async fn fetch_txids() -> Vec<MempoolTransaction> {
 
     // Construct the full URL
     let url = format!("{}/mempool/recent", MEMPOOL_SPACE_API_BASE);
-    println!("Fetching data from: {}", url);
+    info!("\n{}", url);
 
     // Make the GET request and get the response
     let response = client.get(&url).send().await.expect("");
@@ -43,21 +43,22 @@ async fn fetch_txids() -> Vec<MempoolTransaction> {
         .expect("");
 
     // Print the number of transactions received
-    println!(
-        "Successfully fetched {} recent mempool transactions.",
+    info!(
+        "\nSuccessfully fetched {} recent mempool transactions.",
         recent_txs.len()
     );
 
     ////let txs = Vec<String>;
     //// Print details of the first few transactions for demonstration
-    //for (i, tx) in recent_txs.iter().take(5).enumerate() {
-    //    println!("\n--- Transaction {} ---", i + 1);
-    //    println!("  TXID: {}", tx.txid);
-    //    println!("  Fee: {} satoshis", tx.fee);
-    //    //println!("  Size: {} bytes", tx.size);
-    //    println!("  VSize: {} vbytes", tx.vsize);
-    //    println!("  Value: {} satoshis", tx.value);
-    //}
+    for (i, tx) in recent_txs.iter().take(10).enumerate() {
+        trace!("\n--- Transaction {} ---", i + 1);
+        trace!("  TXID: {}", tx.txid);
+        let _ = get_tx_hex(tx.txid.clone());
+        trace!("  Fee: {} satoshis", tx.fee);
+        //println!("  Size: {} bytes", tx.size);
+        trace!("  VSize: {} vbytes", tx.vsize);
+        trace!("  Value: {} satoshis", tx.value);
+    }
 
     // You can also print the entire JSON structure if you want to inspect it
     // let raw_json: serde_json::Value = serde_json::from_str(&response.text().await?)?;
@@ -66,58 +67,76 @@ async fn fetch_txids() -> Vec<MempoolTransaction> {
     recent_txs
 }
 
-pub async fn get_tx_hex(tx: MempoolTransaction) -> Result<Response, Error> {
+pub async fn get_tx_hex(txid: String) -> Result<Response, Error> {
     //curl -sSL "https://mempool.space/api/tx/15e10745f15593a899cef391191bdd3d7c12412cc4696b7bcb669d0feadc8521/hex"
     // Create an HTTP client
     let client = Client::new();
 
+    warn!("\ntxid={}", txid);
     // Construct the full URL
-    let url = format!("{}/tx/{}/hex", MEMPOOL_SPACE_API_BASE, tx.txid);
-    println!("Fetching data from: {}", url);
+    let url = format!("{}/tx/{}/hex", MEMPOOL_SPACE_API_BASE, txid);
+    warn!("Fetching data from:\n{}", url);
 
     // Make the GET request and get the response
     let response = client.get(&url).send().await.expect("");
+    //println!("\nresponse:\n{:?}", response.text().await);
 
     // Check if the request was successful (HTTP status 200 OK)
     // If not, reqwest::Response::error_for_status() will convert HTTP errors
     // into a reqwest::Error which can be propagated by `?`.
-    let response = response.error_for_status()?;
+    //let response = response.error_for_status()?;
 
     Ok(response)
 }
 
+async fn tx_obfuscation() -> Result<()> {
+    let client = MempoolClient::new(Network::Bitcoin);
+    let result = fetch_txids().await;
+    for tx in result {
+        warn!("\ntx.txid={}", tx.txid);
+        let res = get_tx_hex(tx.txid).await?;
+        //info!("\nres={:?}", res.text().await.expect("").clone());
+        let txid = res.text().await.expect("").clone().to_string();
+        //info!("\ntxid={:?}", txid.to_string());
+        match client.broadcast_transaction(&txid).await {
+            Ok(txid) => {
+                warn!("broadcast success!\ntxid:{}", txid);
+            }
+            Err(e) => {
+                eprintln!("Failed to broadcast transaction:\n{:?}", e);
+            }
+        }
+    }
+
+    Ok(())
+}
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt().with_target(false).init();
-
     let args = Args::parse();
     let tx_hex_string = args.tx.clone();
     let tx = bitcoin::consensus::deserialize::<Transaction>(&hex::decode(tx_hex_string)?)?;
     let txid = tx.compute_txid();
 
-    let result = fetch_txids().await;
-    for tx in result {
-        info!("{}", tx.txid);
-        let res = get_tx_hex(tx).await;
-        info!("{:?}", res);
-    }
+    let _ = tx_obfuscation().await;
 
     let client = MempoolClient::new(Network::Bitcoin);
-
     match client.broadcast_transaction(&args.tx.clone()).await {
         Ok(txid) => {
-            info!("Transaction broadcast successfully! TXID: {}", txid);
+            info!("broadcast success!\ntxid:{}", txid);
         }
         Err(e) => {
-            eprintln!("Failed to broadcast transaction: {:?}", e);
+            eprintln!("Failed to broadcast transaction:\n{:?}", e);
         }
     }
+
+    let _ = tx_obfuscation().await;
 
     let mut seed_addrs = Vec::new();
     let mut seed_tasks = JoinSet::new();
 
     for seed_host in DNS_SEEDS {
-        info!("fetching addrs from {:?}", seed_host);
+        info!("fetching addrs from:\n{:?}", seed_host);
 
         let host = seed_host.to_owned();
 
@@ -141,24 +160,24 @@ async fn main() -> Result<()> {
     while let Some(res) = seed_tasks.join_next().await {
         match res {
             Ok(Ok((host, addresses))) => {
-                info!("{} returned {} IPs", host, addresses.len());
+                info!("\n{} returned {} IPs", host, addresses.len());
                 seed_addrs.extend(addresses);
             }
             Ok(Err(crawl_error)) => {
-                error!("dns seed node error: {crawl_error},");
+                error!("\ndns seed node error: {crawl_error},");
             }
             Err(join_error) => {
-                error!("join error during dns seed: {join_error}");
+                error!("\njoin error during dns seed: {join_error}");
             }
         }
     }
 
-    info!("found {} seed node addresses", seed_addrs.len());
+    info!("\nfound {} seed node addresses", seed_addrs.len());
     seed_addrs.shuffle(&mut rand::rng());
 
-    info!("time to blast some nodes with pigeon poop! 🐦💩");
+    info!("\ntime to blast some nodes with pigeon poop! 🐦💩");
 
-    info!("blasting tx {:?} to libre relay nodes...", txid);
+    info!("\nblasting tx {:?} to libre relay nodes...", txid);
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES));
 
