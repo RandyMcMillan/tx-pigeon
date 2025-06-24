@@ -14,14 +14,13 @@ use tokio::{net::lookup_host, sync::Semaphore, task::JoinSet, time::timeout};
 use tracing::{error, info};
 
 use anyhow::{Context, Result};
-use reqwest::{Client, Response, Error};
+use reqwest::{Client, Error, Response};
 use serde::{Deserialize, Serialize};
 
 // Base URL for the Mempool.space API
 const MEMPOOL_SPACE_API_BASE: &str = "https://mempool.space/api";
 
-async fn fetch_txids()-> Vec<MempoolTransaction> {
-
+async fn fetch_txids() -> Vec<MempoolTransaction> {
     // Create an HTTP client
     let client = Client::new();
 
@@ -40,7 +39,8 @@ async fn fetch_txids()-> Vec<MempoolTransaction> {
     let recent_txs: Vec<MempoolTransaction> = response
         .json()
         .await
-        .context("Failed to parse JSON response from mempool.space").expect("");
+        .context("Failed to parse JSON response from mempool.space")
+        .expect("");
 
     // Print the number of transactions received
     println!(
@@ -48,34 +48,31 @@ async fn fetch_txids()-> Vec<MempoolTransaction> {
         recent_txs.len()
     );
 
-	//let txs = Vec<String>;
-    // Print details of the first few transactions for demonstration
-    for (i, tx) in recent_txs.iter().take(5).enumerate() {
-        println!("\n--- Transaction {} ---", i + 1);
-        println!("  TXID: {}", tx.txid);
-        println!("  Fee: {} satoshis", tx.fee);
-        //println!("  Size: {} bytes", tx.size);
-        println!("  VSize: {} vbytes", tx.vsize);
-        println!("  Value: {} satoshis", tx.value);
-    }
+    ////let txs = Vec<String>;
+    //// Print details of the first few transactions for demonstration
+    //for (i, tx) in recent_txs.iter().take(5).enumerate() {
+    //    println!("\n--- Transaction {} ---", i + 1);
+    //    println!("  TXID: {}", tx.txid);
+    //    println!("  Fee: {} satoshis", tx.fee);
+    //    //println!("  Size: {} bytes", tx.size);
+    //    println!("  VSize: {} vbytes", tx.vsize);
+    //    println!("  Value: {} satoshis", tx.value);
+    //}
 
     // You can also print the entire JSON structure if you want to inspect it
     // let raw_json: serde_json::Value = serde_json::from_str(&response.text().await?)?;
     // println!("\nRaw JSON response (first 1000 chars):\n{}", &serde_json::to_string_pretty(&raw_json)?[..1000]);
 
-	recent_txs
-
+    recent_txs
 }
 
 pub async fn get_tx_hex(tx: MempoolTransaction) -> Result<Response, Error> {
-
-
-	//curl -sSL "https://mempool.space/api/tx/15e10745f15593a899cef391191bdd3d7c12412cc4696b7bcb669d0feadc8521/hex"
+    //curl -sSL "https://mempool.space/api/tx/15e10745f15593a899cef391191bdd3d7c12412cc4696b7bcb669d0feadc8521/hex"
     // Create an HTTP client
     let client = Client::new();
 
     // Construct the full URL
-    let url = format!("{}/tx/{}", MEMPOOL_SPACE_API_BASE, tx.txid);
+    let url = format!("{}/tx/{}/hex", MEMPOOL_SPACE_API_BASE, tx.txid);
     println!("Fetching data from: {}", url);
 
     // Make the GET request and get the response
@@ -86,7 +83,7 @@ pub async fn get_tx_hex(tx: MempoolTransaction) -> Result<Response, Error> {
     // into a reqwest::Error which can be propagated by `?`.
     let response = response.error_for_status()?;
 
-	Ok(response)
+    Ok(response)
 }
 
 #[tokio::main]
@@ -97,6 +94,13 @@ async fn main() -> Result<()> {
     let tx_hex_string = args.tx.clone();
     let tx = bitcoin::consensus::deserialize::<Transaction>(&hex::decode(tx_hex_string)?)?;
     let txid = tx.compute_txid();
+
+    let result = fetch_txids().await;
+    for tx in result {
+        info!("{}", tx.txid);
+        let res = get_tx_hex(tx).await;
+        info!("{:?}", res);
+    }
 
     let client = MempoolClient::new(Network::Bitcoin);
 
