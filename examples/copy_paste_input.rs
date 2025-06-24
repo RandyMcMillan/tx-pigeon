@@ -2,10 +2,9 @@ use anyhow::Result;
 use arti_client::{IsolationToken, StreamPrefs, TorClient, TorClientConfig};
 use bitcoin::{Network, Transaction};
 use tx_pigeon::{
-    Args, DNS_SEEDS, MAX_CONCURRENT_DELIVERIES, NetworkAddress, crawl_seed_node, deliver_poop_tx,
+    DNS_SEEDS, MAX_CONCURRENT_DELIVERIES, NetworkAddress, crawl_seed_node, deliver_poop_tx,
 };
 
-use clap::Parser;
 use crossterm::input::input;
 use rand::seq::SliceRandom;
 
