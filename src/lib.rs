@@ -180,7 +180,7 @@ pub async fn deliver_poop_tx(
                 NetworkMessage::Tx(received_tx) => {
                     if received_tx.compute_txid() == txid {
                         info!(
-                            "[CONFIRMED HIT] {:?} (UA: '{}') direct hit confirmed on libre node! poop deliverd",
+                            "[CONFIRMED HIT]\n{:?}\n(UA: '{}') direct hit confirmed on libre node! poop deliverd",
                             addr, peer_version_message.user_agent
                         );
                         tx_confirmed_by_peer = true;
@@ -211,7 +211,7 @@ pub async fn deliver_poop_tx(
                         }
                     }) {
                         info!(
-                            "[CONFIRMED HIT] INV returned TX: direct hit confirmed on libre node! poop deliverd to {:?}! (UA: '{}')",
+                            "[CONFIRMED HIT]\nINV returned TX:\ndirect hit confirmed on libre node!\npoop deliverd to {:?}! (UA: '{}')",
                             addr, peer_version_message.user_agent
                         );
                         tx_confirmed_by_peer = true;
@@ -242,7 +242,7 @@ pub async fn deliver_poop_tx(
 
 pub async fn crawl_seed_node(seed: &SocketAddr) -> Result<Vec<NetworkAddress>> {
     let mut found_peers = Vec::new();
-    info!("crawling seed {:?}", seed);
+    info!("\ncrawling seed {:?}", seed);
     let mut stream = match timeout(
         Duration::from_secs(2),
         tokio::net::TcpStream::connect((seed.ip().to_string(), seed.port())),
@@ -262,7 +262,7 @@ pub async fn crawl_seed_node(seed: &SocketAddr) -> Result<Vec<NetworkAddress>> {
 
     let (mut rd, mut wr) = stream.split();
 
-    info!("waiting for addresses from {:?}...", seed);
+    info!("\nwaiting for addresses from\n{:?}", seed);
     loop {
         let msg = match timeout(CONNECTION_TIMEOUT, read_msg(&mut rd)).await {
             Ok(Ok(m)) => m,
