@@ -56,12 +56,12 @@ enum NetworkAddress {
     Onion(String),
 }
 
-pub async fn blast_transaction_hex(tx_hex: &str) -> Result<usize> {
+pub async fn blast_transaction_hex(tx_hex: &str, tor_only: bool) -> Result<usize> {
     let tx = bitcoin::consensus::deserialize::<Transaction>(&hex::decode(tx_hex)?)?;
-    blast_transaction(tx).await
+    blast_transaction(tx, tor_only).await
 }
 
-pub async fn blast_transaction(tx: Transaction) -> Result<usize> {
+pub async fn blast_transaction(tx: Transaction, tor_only: bool) -> Result<usize> {
     let txid = tx.compute_txid();
 
     let mut seed_addrs = Vec::new();
@@ -143,6 +143,18 @@ pub async fn blast_transaction(tx: Transaction) -> Result<usize> {
         "found {} addresses advertising the libre relay service flag",
         libre_peers.len()
     );
+
+    let libre_peers = if tor_only {
+        info!("Tor-only mode enabled; filtering clearnet peers");
+        libre_peers
+            .into_iter()
+            .filter(|addr| matches!(addr, NetworkAddress::Onion(_)))
+            .collect()
+    } else {
+        libre_peers
+    };
+
+    info!("using {} peers after tor-only filtering", libre_peers.len());
 
     info!("Bootstrapping Tor client...");
     let config = TorClientConfig::builder().build()?;
