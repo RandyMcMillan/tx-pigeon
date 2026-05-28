@@ -31,6 +31,8 @@ use tokio::{
 use tracing::{error, info};
 use tor_rtcompat::PreferredRuntime;
 
+pub mod topic;
+
 const DNS_SEEDS: &[&str] = &[
     "dnsseed.bluematt.me",
     "dnsseed.bitcoin.dashjr-list-of-p2p-nodes.us",
