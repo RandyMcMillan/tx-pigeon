@@ -6,6 +6,14 @@ in the name of censorship resistance money
 
 - If your tx is accepted in a block, GetData(inv(tx)) returns the tx from the lastest block, so that will make garbage man nodes apear as normal libre relay nodes.
 
+## Library
+
+The core tx blasting logic is now exposed as a Rust library:
+
+```rust
+let delivered = tx_pigeon::blast_transaction_hex(tx_hex).await?;
+```
+
 
 ## Setup
 
