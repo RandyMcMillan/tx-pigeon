@@ -159,7 +159,7 @@ pub async fn blast_transaction(tx: Transaction) -> Result<usize> {
         let tor_client = tor_client.clone();
         let peer_addr_cloned = peer_addr.clone();
         let prefs = prefs.clone();
-        eprintln!("[TX {txid}] scheduling delivery to {:?}", peer_addr_cloned);
+        eprintln!("\n[TX {txid}]\nscheduling delivery to {:?}", peer_addr_cloned);
         poop_delivery_tasks.spawn(async move {
             let _permit_guard = permit;
             match deliver_poop_tx(peer_addr_cloned.clone(), tx_clone, tor_client, prefs).await {
@@ -192,14 +192,14 @@ pub async fn blast_transaction(tx: Transaction) -> Result<usize> {
 
     if success_count == 0 {
         error!(
-            "No libre relay nodes accepted the transaction. TX {} may already be in a block or its invalid.",
+            "No libre relay nodes accepted the transaction.\nTX {} may already be in a block or its invalid.",
             txid
         );
         return Ok(0);
     }
 
     info!(
-        "TX: {:?} blasted to {} libre relay nodes. GLHF",
+        "TX: {:?}\nblasted to {} libre relay nodes. GLHF",
         txid, success_count,
     );
 
@@ -237,7 +237,7 @@ async fn deliver_poop_tx(
 ) -> Result<bool> {
     let txid = tx.compute_txid();
 
-    eprintln!("[TX {txid}] connecting to {:?}", addr);
+    eprintln!("[TX {txid}]\nconnecting to {:?}", addr);
     let mut stream = match &addr {
         NetworkAddress::Ip(sa) => {
             let target = (sa.ip().to_string(), sa.port());
@@ -257,9 +257,9 @@ async fn deliver_poop_tx(
         .await
         .map_err(|_| anyhow::anyhow!("timeout connecting to {}", host))??,
     };
-    eprintln!("[TX {txid}] connected to {:?}", addr);
+    eprintln!("[TX {txid}]\nconnected to {:?}", addr);
 
-    eprintln!("[TX {txid}] sending version to {:?}", addr);
+    eprintln!("[TX {txid}]\nsending version to {:?}", addr);
     if let Err(e) = send_msg(&mut stream, NetworkMessage::Version(build_version_msg())).await {
         return Err(e);
     }
@@ -297,23 +297,23 @@ async fn deliver_poop_tx(
     let libre_flag_check = ServiceFlags::from(NODE_LIBRE_RELAY);
     if !peer_version_message.services.has(libre_flag_check) {
         eprintln!(
-            "[TX {txid}] {:?} does not advertise NODE_LIBRE_RELAY, skipping",
+            "[TX {txid}] {:?}\ndoes not advertise NODE_LIBRE_RELAY, skipping",
             addr
         );
         return Ok(false);
     }
 
-    eprintln!("[TX {txid}] sending verack to {:?}", addr);
+    eprintln!("[TX {txid}]\nsending verack to {:?}", addr);
     if let Err(e) = send_msg(&mut wr, NetworkMessage::Verack).await {
         return Err(e);
     }
 
-    eprintln!("[TX {txid}] sending tx to {:?}", addr);
+    eprintln!("[TX {txid}]\nsending tx to {:?}", addr);
     if let Err(e) = send_msg(&mut wr, NetworkMessage::Tx(tx.clone())).await {
         return Err(e);
     }
 
-    eprintln!("[TX {txid}] sending getdata to {:?}", addr);
+    eprintln!("[TX {txid}]\nsending getdata to {:?}", addr);
     if let Err(e) = send_msg(
         &mut wr,
         NetworkMessage::GetData(vec![Inventory::Transaction(txid)]),
@@ -361,7 +361,7 @@ async fn deliver_poop_tx(
                         }
                     }) {
                         info!(
-                            "[CONFIRMED HIT] INV returned TX: direct hit confirmed on libre node! poop deliverd to {:?}! (UA: '{}')",
+                            "[CONFIRMED HIT] INV returned TX:\ndirect hit confirmed on libre node!\npoop deliverd to\n{:?}! (UA: '{}')",
                             addr, peer_version_message.user_agent
                         );
                         tx_confirmed_by_peer = true;
