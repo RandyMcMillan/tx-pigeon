@@ -58,12 +58,12 @@ enum NetworkAddress {
     Onion(String),
 }
 
-pub async fn blast_transaction_hex(tx_hex: &str, tor_only: bool) -> Result<usize> {
+pub async fn blast_transaction_hex(tx_hex: &str, tor_only: bool, relay: bool) -> Result<usize> {
     let tx = bitcoin::consensus::deserialize::<Transaction>(&hex::decode(tx_hex)?)?;
-    blast_transaction(tx, tor_only).await
+    blast_transaction(tx, tor_only, relay).await
 }
 
-pub async fn blast_transaction(tx: Transaction, tor_only: bool) -> Result<usize> {
+pub async fn blast_transaction(tx: Transaction, tor_only: bool, relay: bool) -> Result<usize> {
     let txid = tx.compute_txid();
 
     let mut seed_addrs = Vec::new();
@@ -176,7 +176,15 @@ pub async fn blast_transaction(tx: Transaction, tor_only: bool) -> Result<usize>
         eprintln!("\n[TX {txid}]\nscheduling delivery to {:?}", peer_addr_cloned);
         poop_delivery_tasks.spawn(async move {
             let _permit_guard = permit;
-            match deliver_poop_tx(peer_addr_cloned.clone(), tx_clone, tor_client, prefs).await {
+            match deliver_poop_tx(
+                peer_addr_cloned.clone(),
+                tx_clone,
+                tor_client,
+                prefs,
+                relay,
+            )
+            .await
+            {
                 Ok(true) => Ok(peer_addr_cloned.clone()),
                 Ok(false) => Err((
                     peer_addr_cloned.clone(),
@@ -220,7 +228,7 @@ pub async fn blast_transaction(tx: Transaction, tor_only: bool) -> Result<usize>
     Ok(success_count)
 }
 
-fn build_version_msg() -> VersionMessage {
+fn build_version_msg(relay: bool) -> VersionMessage {
     VersionMessage {
         version: 70016,
         services: ServiceFlags::from(NODE_NETWORK | NODE_WITNESS | NODE_LIBRE_RELAY),
@@ -239,7 +247,7 @@ fn build_version_msg() -> VersionMessage {
         nonce: rand::random::<u64>(),
         user_agent: "/Satoshi:27.0.0/".into(),
         start_height: 897157,
-        relay: true,
+        relay,
     }
 }
 
@@ -248,6 +256,7 @@ async fn deliver_poop_tx(
     tx: Transaction,
     tor_client: Arc<TorClient<PreferredRuntime>>,
     prefs: StreamPrefs,
+    relay: bool,
 ) -> Result<bool> {
     let txid = tx.compute_txid();
 
@@ -274,7 +283,7 @@ async fn deliver_poop_tx(
     eprintln!("[TX {txid}]\nconnected to {:?}", addr);
 
     eprintln!("[TX {txid}]\nsending version to {:?}", addr);
-    if let Err(e) = send_msg(&mut stream, NetworkMessage::Version(build_version_msg())).await {
+    if let Err(e) = send_msg(&mut stream, NetworkMessage::Version(build_version_msg(relay))).await {
         return Err(e);
     }
 
@@ -422,7 +431,7 @@ async fn crawl_seed_node(seed: &SocketAddr) -> Result<Vec<NetworkAddress>> {
         }
     };
 
-    send_msg(&mut stream, NetworkMessage::Version(build_version_msg())).await?;
+    send_msg(&mut stream, NetworkMessage::Version(build_version_msg(true))).await?;
 
     let (mut rd, mut wr) = stream.split();
 

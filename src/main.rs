@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
         }
         None => {
             let tx = args.tx.context("missing --tx")?;
-            tx_pigeon::blast_transaction_hex(&tx, args.tor_only).await?;
+            tx_pigeon::blast_transaction_hex(&tx, args.tor_only, true).await?;
         }
     }
 
