@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Parser, arg, command};
+use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
