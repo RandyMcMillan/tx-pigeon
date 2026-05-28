@@ -159,6 +159,7 @@ pub async fn blast_transaction(tx: Transaction) -> Result<usize> {
         let tor_client = tor_client.clone();
         let peer_addr_cloned = peer_addr.clone();
         let prefs = prefs.clone();
+        eprintln!("[TX {txid}] scheduling delivery to {:?}", peer_addr_cloned);
         poop_delivery_tasks.spawn(async move {
             let _permit_guard = permit;
             match deliver_poop_tx(peer_addr_cloned.clone(), tx_clone, tor_client, prefs).await {
@@ -236,6 +237,7 @@ async fn deliver_poop_tx(
 ) -> Result<bool> {
     let txid = tx.compute_txid();
 
+    eprintln!("[TX {txid}] connecting to {:?}", addr);
     let mut stream = match &addr {
         NetworkAddress::Ip(sa) => {
             let target = (sa.ip().to_string(), sa.port());
@@ -255,7 +257,9 @@ async fn deliver_poop_tx(
         .await
         .map_err(|_| anyhow::anyhow!("timeout connecting to {}", host))??,
     };
+    eprintln!("[TX {txid}] connected to {:?}", addr);
 
+    eprintln!("[TX {txid}] sending version to {:?}", addr);
     if let Err(e) = send_msg(&mut stream, NetworkMessage::Version(build_version_msg())).await {
         return Err(e);
     }
@@ -292,17 +296,24 @@ async fn deliver_poop_tx(
 
     let libre_flag_check = ServiceFlags::from(NODE_LIBRE_RELAY);
     if !peer_version_message.services.has(libre_flag_check) {
+        eprintln!(
+            "[TX {txid}] {:?} does not advertise NODE_LIBRE_RELAY, skipping",
+            addr
+        );
         return Ok(false);
     }
 
+    eprintln!("[TX {txid}] sending verack to {:?}", addr);
     if let Err(e) = send_msg(&mut wr, NetworkMessage::Verack).await {
         return Err(e);
     }
 
+    eprintln!("[TX {txid}] sending tx to {:?}", addr);
     if let Err(e) = send_msg(&mut wr, NetworkMessage::Tx(tx.clone())).await {
         return Err(e);
     }
 
+    eprintln!("[TX {txid}] sending getdata to {:?}", addr);
     if let Err(e) = send_msg(
         &mut wr,
         NetworkMessage::GetData(vec![Inventory::Transaction(txid)]),
