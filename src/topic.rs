@@ -2,8 +2,8 @@ use anyhow::{Context, Result};
 use bitcoin::{Transaction, consensus::Decodable, io::Cursor};
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, Swarm, SwarmBuilder, SwarmEvent, gossipsub, mdns,
-    swarm::NetworkBehaviour,
+    Multiaddr, Swarm, SwarmBuilder, gossipsub, mdns,
+    swarm::{NetworkBehaviour, SwarmEvent},
 };
 use sha3::{Digest, Sha3_256};
 use std::collections::HashSet;
