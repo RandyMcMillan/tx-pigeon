@@ -309,7 +309,7 @@ async fn deliver_poop_tx(
     let libre_flag_check = ServiceFlags::from(NODE_LIBRE_RELAY);
     if !peer_version_message.services.has(libre_flag_check) {
         eprintln!(
-            "[TX {txid}] {:?}\ndoes not advertise NODE_LIBRE_RELAY, skipping",
+            "[TX {txid}] {:?}\ndoes not advertise NODE_LIBRE_RELAY,\nskipping",
             addr
         );
         return Ok(false);
