@@ -18,7 +18,10 @@ use sha3::{Digest, Sha3_256};
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -32,6 +35,16 @@ use tracing::{error, info};
 use tor_rtcompat::PreferredRuntime;
 
 pub mod topic;
+
+static TOR_ONLY: AtomicBool = AtomicBool::new(false);
+
+pub fn set_tor_only(enabled: bool) {
+    TOR_ONLY.store(enabled, Ordering::SeqCst);
+}
+
+fn tor_only_enabled() -> bool {
+    TOR_ONLY.load(Ordering::SeqCst)
+}
 
 const DNS_SEEDS: &[&str] = &[
     "dnsseed.bluematt.me",
@@ -59,11 +72,12 @@ enum NetworkAddress {
 }
 
 pub async fn blast_transaction_hex(tx_hex: &str, tor_only: bool, relay: bool) -> Result<usize> {
+    set_tor_only(tor_only);
     let tx = bitcoin::consensus::deserialize::<Transaction>(&hex::decode(tx_hex)?)?;
     blast_transaction(tx, tor_only, relay).await
 }
 
-pub async fn blast_transaction(tx: Transaction, tor_only: bool, relay: bool) -> Result<usize> {
+pub async fn blast_transaction(tx: Transaction, _tor_only: bool, relay: bool) -> Result<usize> {
     let txid = tx.compute_txid();
 
     let mut seed_addrs = Vec::new();
@@ -146,7 +160,7 @@ pub async fn blast_transaction(tx: Transaction, tor_only: bool, relay: bool) -> 
         libre_peers.len()
     );
 
-    let libre_peers = if tor_only {
+    let libre_peers = if tor_only_enabled() {
         info!("Tor-only mode enabled; filtering clearnet peers");
         libre_peers
             .into_iter()
@@ -168,6 +182,11 @@ pub async fn blast_transaction(tx: Transaction, tor_only: bool, relay: bool) -> 
 
     let mut poop_delivery_tasks = JoinSet::new();
     for peer_addr in libre_peers.clone() {
+        if tor_only_enabled() && matches!(peer_addr, NetworkAddress::Ip(_)) {
+            eprintln!("[TX {txid}] tor-only enabled; skipping clearnet peer {:?}", peer_addr);
+            continue;
+        }
+
         let tx_clone = tx.clone();
         let permit = semaphore.clone().acquire_owned().await?;
         let tor_client = tor_client.clone();
@@ -259,6 +278,11 @@ async fn deliver_poop_tx(
     relay: bool,
 ) -> Result<bool> {
     let txid = tx.compute_txid();
+
+    if tor_only_enabled() && matches!(addr, NetworkAddress::Ip(_)) {
+        eprintln!("[TX {txid}] tor-only enabled; skipping {:?}", addr);
+        return Ok(false);
+    }
 
     eprintln!("[TX {txid}]\nconnecting to {:?}", addr);
     let mut stream = match &addr {
