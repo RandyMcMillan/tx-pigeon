@@ -130,7 +130,7 @@ pub async fn run_gossip_client(label: impl Into<String>, tor_only: bool) -> Resu
                 }
                 SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                     for (peer_id, addr) in list {
-                        info!(%label, ?peer_id, ?addr, "gossip client discovered peer");
+                        debug!(%label, ?peer_id, ?addr, "gossip client discovered peer");
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                         if let Err(err) = swarm.dial(addr.clone()) {
                             warn!(?peer_id, ?addr, "gossip client failed to dial discovered peer: {err}");
