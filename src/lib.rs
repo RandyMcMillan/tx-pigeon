@@ -400,7 +400,7 @@ async fn fetch_peer_transactions(
         return Ok(Vec::new());
     }
 
-    eprintln!("[FETCH] connecting to {:?}", addr);
+    println!("[FETCH] connecting to {:?}", addr);
     let mut stream = match &addr {
         NetworkAddress::Ip(sa) => {
             let target = (sa.ip().to_string(), sa.port());
@@ -419,19 +419,25 @@ async fn fetch_peer_transactions(
         .await
         .map_err(|_| anyhow::anyhow!("timeout connecting to {}", host))??,
     };
-    eprintln!("[FETCH] connected to {:?}", addr);
+    println!("[FETCH] connected to {:?}", addr);
 
     eprintln!("[FETCH] sending version to {:?}", addr);
     send_msg(&mut stream, NetworkMessage::Version(build_version_msg(relay))).await?;
 
     let (mut rd, mut wr) = stream.split();
     let peer_version_message = wait_for_version(&mut rd, &addr).await?;
+    info!(
+        "[FETCH] {:?} received version from peer (UA: '{}')",
+        addr, peer_version_message.user_agent
+    );
 
     eprintln!("[FETCH] sending verack to {:?}", addr);
     send_msg(&mut wr, NetworkMessage::Verack).await?;
+    info!("[FETCH] {:?} sent verack", addr);
 
     eprintln!("[FETCH] requesting mempool from {:?}", addr);
     send_msg(&mut wr, NetworkMessage::MemPool).await?;
+    info!("[FETCH] {:?} requested mempool", addr);
 
     let mut announced = HashSet::<bitcoin::Txid>::new();
     let mut request_list = Vec::<bitcoin::Txid>::new();
@@ -440,7 +446,7 @@ async fn fetch_peer_transactions(
             Ok(Ok(m)) => match m.payload() {
                 NetworkMessage::Inv(inv_list) => {
                     info!(
-                        "[FETCH] {:?} (UA: '{}') advertised {} inventory entries",
+                        "[FETCH] {:?} (UA: '{}') advertised {} inventory entries; iterating",
                         addr,
                         peer_version_message.user_agent,
                         inv_list.len()
