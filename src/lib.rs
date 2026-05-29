@@ -1,5 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arti_client::{IsolationToken, StreamPrefs, TorClient, TorClientConfig};
+use arti_client::config::TorClientConfigBuilder;
+use directories::ProjectDirs;
 use bitcoin::{
     Transaction,
     consensus::{Decodable, Encodable},
@@ -18,6 +20,7 @@ use sha3::{Digest, Sha3_256};
 use std::{
     collections::HashSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -47,6 +50,34 @@ pub fn set_tor_only(enabled: bool) {
 
 fn tor_only_enabled() -> bool {
     TOR_ONLY.load(Ordering::SeqCst)
+}
+
+fn now_utc_integer() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn arti_state_dir(run_id: u64) -> Result<PathBuf> {
+    let project_dirs = ProjectDirs::from("org", "torproject", "Arti")
+        .context("failed to resolve Arti project directories")?;
+    Ok(project_dirs
+        .data_local_dir()
+        .join("arti")
+        .join(run_id.to_string()))
+}
+
+fn tor_client_config_for_run(run_id: u64) -> Result<TorClientConfig> {
+    let state_dir = arti_state_dir(run_id)?;
+    let project_dirs = ProjectDirs::from("org", "torproject", "Arti")
+        .context("failed to resolve Arti project directories")?;
+    let cache_dir = project_dirs
+        .cache_dir()
+        .join("arti")
+        .join(run_id.to_string());
+
+    Ok(TorClientConfigBuilder::from_directories(state_dir, cache_dir).build()?)
 }
 
 const DNS_SEEDS: &[&str] = &[
@@ -95,7 +126,7 @@ pub async fn blast_transaction(tx: Transaction, _tor_only: bool, relay: bool) ->
     info!("using {} peers after tor-only filtering", libre_peers.len());
 
     info!("Bootstrapping Tor client...");
-    let config = TorClientConfig::builder().build()?;
+    let config = tor_client_config_for_run(now_utc_integer())?;
     let tor_client = Arc::new(TorClient::create_bootstrapped(config).await?);
 
     let common_token = IsolationToken::no_isolation();
@@ -180,7 +211,7 @@ pub async fn fetch_transactions(limit: usize, tor_only: bool, relay: bool) -> Re
     info!("using {} peers after tor-only filtering", libre_peers.len());
 
     info!("Bootstrapping Tor client...");
-    let config = TorClientConfig::builder().build()?;
+    let config = tor_client_config_for_run(now_utc_integer())?;
     let tor_client = Arc::new(TorClient::create_bootstrapped(config).await?);
 
     let common_token = IsolationToken::no_isolation();
@@ -431,6 +462,28 @@ async fn discover_libre_peers() -> Result<HashSet<NetworkAddress>> {
     );
 
     Ok(libre_peers)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::arti_state_dir;
+
+    #[test]
+    fn appends_run_id_to_arti_state_dir() {
+        let run_id = 1_717_000_000;
+        let state_dir = arti_state_dir(run_id).expect("state dir");
+        assert_eq!(
+            state_dir.file_name().and_then(|value| value.to_str()),
+            Some("1717000000")
+        );
+        assert_eq!(
+            state_dir
+                .parent()
+                .and_then(|value| value.file_name())
+                .and_then(|value| value.to_str()),
+            Some("arti")
+        );
+    }
 }
 
 fn filter_peers_for_tor_only(peers: HashSet<NetworkAddress>) -> HashSet<NetworkAddress> {
