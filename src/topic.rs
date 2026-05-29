@@ -324,6 +324,7 @@ async fn publish_topic_tx(
     let raw_bytes = hex::decode(&tx_hex).context("failed to decode transaction hex")?;
 
     info!(%label, %txid, "publishing transaction to bitcoin-pigeon topic");
+    log_deserialized_transaction(label, &tx);
     let published = publish_with_retry(swarm, topic, raw_bytes.clone(), txid).await?;
     if !published {
         warn!(
@@ -385,6 +386,7 @@ async fn handle_topic_tx(
         return Ok(());
     }
 
+    log_deserialized_transaction(label, &tx);
     log_local_mempool(label).await?;
 
     let tx_hex = hex::encode(data);
@@ -420,6 +422,13 @@ async fn observe_topic_tx(
 
 fn log_deserialized_transaction(label: &str, tx: &Transaction) {
     let txid = tx.compute_txid();
+    println!(
+        "[{label}] deserialized tx {txid} version={:?} inputs={} outputs={} lock_time={:?}",
+        tx.version,
+        tx.input.len(),
+        tx.output.len(),
+        tx.lock_time
+    );
     info!(
         %label,
         %txid,
@@ -431,6 +440,15 @@ fn log_deserialized_transaction(label: &str, tx: &Transaction) {
     );
 
     for (index, input) in tx.input.iter().enumerate() {
+        println!(
+            "[{label}] tx {txid} input {}/{} prevout={:?} sequence={:?} script_sig_len={} witness_items={}",
+            index + 1,
+            tx.input.len(),
+            input.previous_output,
+            input.sequence,
+            input.script_sig.len(),
+            input.witness.len()
+        );
         info!(
             %label,
             %txid,
@@ -444,11 +462,18 @@ fn log_deserialized_transaction(label: &str, tx: &Transaction) {
     }
 
     for (index, output) in tx.output.iter().enumerate() {
+        println!(
+            "[{label}] tx {txid} output {}/{} value={} sats script_pubkey={}",
+            index + 1,
+            tx.output.len(),
+            output.value.to_sat(),
+            output.script_pubkey
+        );
         info!(
             %label,
             %txid,
             output_index = index,
-            value = ?output.value,
+            value = output.value.to_sat(),
             script_pubkey = %output.script_pubkey,
             "gossip client tx output"
         );
