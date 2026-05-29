@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use bitcoin::{Transaction, consensus::Decodable, io::Cursor};
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, Swarm, SwarmBuilder, gossipsub, mdns,
+    Multiaddr, Swarm, SwarmBuilder, autonat, dcutr, gossipsub, mdns, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use sha3::{Digest, Sha3_256};
@@ -22,6 +22,9 @@ const BITCOIN_PIGEON_TOPIC: &str = "bitcoin-pigeon";
 struct TopicBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
+    relay_client: relay::client::Behaviour,
+    autonat: autonat::Behaviour,
+    dcutr: dcutr::Behaviour,
 }
 
 pub async fn run_topic_network(tx_hex: Option<String>, tor_only: bool) -> Result<()> {
@@ -50,6 +53,15 @@ pub async fn run_topic_network(tx_hex: Option<String>, tor_only: bool) -> Result
                 }
                 SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::GossipsubNotSupported { peer_id })) => {
                     warn!(?peer_id, "peer does not support gossipsub");
+                }
+                SwarmEvent::Behaviour(TopicBehaviourEvent::RelayClient(event)) => {
+                    info!(?event, "relay client event");
+                }
+                SwarmEvent::Behaviour(TopicBehaviourEvent::Autonat(event)) => {
+                    info!(?event, "autonat event");
+                }
+                SwarmEvent::Behaviour(TopicBehaviourEvent::Dcutr(event)) => {
+                    info!(?event, "hole punch event");
                 }
                 SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                     for (peer_id, addr) in list {
@@ -106,6 +118,15 @@ pub async fn run_gossip_client(label: impl Into<String>, tor_only: bool) -> Resu
                 }
                 SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
                     info!(%label, ?peer_id, %topic, "gossip client subscribed");
+                }
+                SwarmEvent::Behaviour(TopicBehaviourEvent::RelayClient(event)) => {
+                    info!(%label, ?event, "gossip client relay event");
+                }
+                SwarmEvent::Behaviour(TopicBehaviourEvent::Autonat(event)) => {
+                    info!(%label, ?event, "gossip client autonat event");
+                }
+                SwarmEvent::Behaviour(TopicBehaviourEvent::Dcutr(event)) => {
+                    info!(%label, ?event, "gossip client hole punch event");
                 }
                 SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                     for (peer_id, addr) in list {
@@ -185,6 +206,15 @@ pub async fn spawn_topic_network(label: impl Into<String>, tor_only: bool) -> Re
                     SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::GossipsubNotSupported { peer_id })) => {
                         warn!(?peer_id, "peer does not support gossipsub");
                     }
+                    SwarmEvent::Behaviour(TopicBehaviourEvent::RelayClient(event)) => {
+                        info!(%label, ?event, "gossip client relay event");
+                    }
+                    SwarmEvent::Behaviour(TopicBehaviourEvent::Autonat(event)) => {
+                        info!(%label, ?event, "gossip client autonat event");
+                    }
+                    SwarmEvent::Behaviour(TopicBehaviourEvent::Dcutr(event)) => {
+                        info!(%label, ?event, "gossip client hole punch event");
+                    }
                     SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                         for (peer_id, addr) in list {
                             info!(%label, ?peer_id, ?addr, "mdns discovered peer");
@@ -232,7 +262,11 @@ fn build_topic_swarm() -> Result<(Swarm<TopicBehaviour>, gossipsub::IdentTopic)>
             (libp2p::tls::Config::new, libp2p::noise::Config::new),
             libp2p::yamux::Config::default,
         )?
-        .with_behaviour(|keypair| {
+        .with_relay_client(
+            (libp2p::tls::Config::new, libp2p::noise::Config::new),
+            libp2p::yamux::Config::default,
+        )?
+        .with_behaviour(|keypair, relay_client| {
             let peer_id = keypair.public().to_peer_id();
             debug!("peer_id={}", peer_id);
             let topic_name = BITCOIN_PIGEON_TOPIC.to_owned();
@@ -250,8 +284,16 @@ fn build_topic_swarm() -> Result<(Swarm<TopicBehaviour>, gossipsub::IdentTopic)>
                 .map_err(|e| anyhow::anyhow!("failed to build gossipsub behaviour: {e}"))?;
             let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
                 .map_err(|e| anyhow::anyhow!("failed to build mdns behaviour: {e}"))?;
+            let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
+            let dcutr = dcutr::Behaviour::new(peer_id);
 
-            Ok(TopicBehaviour { gossipsub, mdns })
+            Ok(TopicBehaviour {
+                gossipsub,
+                mdns,
+                relay_client,
+                autonat,
+                dcutr,
+            })
         })?
         .build();
 
