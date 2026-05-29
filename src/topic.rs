@@ -381,12 +381,12 @@ async fn handle_topic_tx(
     let tx = decode_transaction_bytes(data)?;
     let txid = tx.compute_txid();
 
+    log_deserialized_transaction(label, &tx);
     if !seen_txs.insert(txid) {
         info!(%label, %txid, "already processed bitcoin-pigeon tx");
         return Ok(());
     }
 
-    log_deserialized_transaction(label, &tx);
     log_local_mempool(label).await?;
 
     let tx_hex = hex::encode(data);
@@ -405,12 +405,12 @@ async fn observe_topic_tx(
     let tx = decode_transaction_bytes(data)?;
     let txid = tx.compute_txid();
 
+    log_deserialized_transaction(label, &tx);
     if !seen_txs.insert(txid) {
         info!(%label, %txid, "already observed bitcoin-pigeon tx");
         return Ok(());
     }
 
-    log_deserialized_transaction(label, &tx);
     log_local_mempool(label).await?;
     info!(%label, %txid, "observed bitcoin-pigeon topic tx");
     if tor_only {
