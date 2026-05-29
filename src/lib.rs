@@ -32,10 +32,11 @@ use tokio::{
     task::JoinSet,
     time::{MissedTickBehavior, interval, timeout},
 };
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tor_rtcompat::PreferredRuntime;
 
 pub mod topic;
+pub mod mempool;
 
 static TOR_ONLY: AtomicBool = AtomicBool::new(false);
 
@@ -103,7 +104,7 @@ pub async fn blast_transaction(tx: Transaction, _tor_only: bool, relay: bool) ->
     let mut poop_delivery_tasks = JoinSet::new();
     for peer_addr in libre_peers.clone() {
         if tor_only_enabled() && matches!(peer_addr, NetworkAddress::Ip(_)) {
-            eprintln!("[TX {txid}] tor-only enabled; skipping clearnet peer {:?}", peer_addr);
+            debug!("[TX {txid}] tor-only enabled; skipping clearnet peer {:?}", peer_addr);
             continue;
         }
 
@@ -112,7 +113,7 @@ pub async fn blast_transaction(tx: Transaction, _tor_only: bool, relay: bool) ->
         let tor_client = tor_client.clone();
         let peer_addr_cloned = peer_addr.clone();
         let prefs = prefs.clone();
-        eprintln!("\n[TX {txid}]\nscheduling delivery to {:?}", peer_addr_cloned);
+        debug!("\n[TX {txid}]\nscheduling delivery to {:?}", peer_addr_cloned);
         poop_delivery_tasks.spawn(async move {
             let _permit_guard = permit;
             match deliver_poop_tx(
@@ -284,8 +285,8 @@ fn build_version_msg(relay: bool) -> VersionMessage {
             ServiceFlags::from(NODE_NETWORK | NODE_WITNESS | NODE_LIBRE_RELAY),
         ),
         nonce: rand::random::<u64>(),
-        user_agent: "/Satoshi:27.0.0/".into(),
-        start_height: 897157,
+        user_agent: "/Satoshi:29.2.0/Knots:20251110/UASF-BIP110:0.1/".into(),
+        start_height: 897157, //get current blockheight minus 20?
         relay,
     }
 }
@@ -396,11 +397,11 @@ async fn fetch_peer_transactions(
     limit: usize,
 ) -> Result<Vec<Transaction>> {
     if tor_only_enabled() && matches!(addr, NetworkAddress::Ip(_)) {
-        eprintln!("[FETCH] tor-only enabled; skipping {:?}", addr);
+        debug!("[FETCH] tor-only enabled; skipping {:?}", addr);
         return Ok(Vec::new());
     }
 
-    println!("[FETCH] connecting to {:?}", addr);
+    debug!("[FETCH] connecting to {:?}", addr);
     let mut stream = match &addr {
         NetworkAddress::Ip(sa) => {
             let target = (sa.ip().to_string(), sa.port());
@@ -419,9 +420,9 @@ async fn fetch_peer_transactions(
         .await
         .map_err(|_| anyhow::anyhow!("timeout connecting to {}", host))??,
     };
-    println!("[FETCH] connected to {:?}", addr);
+    debug!("[FETCH] connected to {:?}", addr);
 
-    eprintln!("[FETCH] sending version to {:?}", addr);
+    debug!("[FETCH] sending version to {:?}", addr);
     send_msg(&mut stream, NetworkMessage::Version(build_version_msg(relay))).await?;
 
     let (mut rd, mut wr) = stream.split();
@@ -431,11 +432,11 @@ async fn fetch_peer_transactions(
         addr, peer_version_message.user_agent
     );
 
-    eprintln!("[FETCH] sending verack to {:?}", addr);
+    debug!("[FETCH] sending verack to {:?}", addr);
     send_msg(&mut wr, NetworkMessage::Verack).await?;
-    info!("[FETCH] {:?} sent verack", addr);
+    debug!("[FETCH] {:?} sent verack", addr);
 
-    eprintln!("[FETCH] requesting mempool from {:?}", addr);
+    debug!("[FETCH] requesting mempool from {:?}", addr);
     send_msg(&mut wr, NetworkMessage::MemPool).await?;
     info!("[FETCH] {:?} requested mempool", addr);
 
@@ -492,7 +493,7 @@ async fn fetch_peer_transactions(
         return Ok(Vec::new());
     }
 
-    eprintln!(
+    debug!(
         "[FETCH] requesting {} txs from {:?}",
         request_list.len(),
         addr
@@ -602,11 +603,11 @@ async fn deliver_poop_tx(
     let txid = tx.compute_txid();
 
     if tor_only_enabled() && matches!(addr, NetworkAddress::Ip(_)) {
-        eprintln!("[TX {txid}] tor-only enabled; skipping {:?}", addr);
+        debug!("[TX {txid}] tor-only enabled; skipping {:?}", addr);
         return Ok(false);
     }
 
-    eprintln!("[TX {txid}]\nconnecting to {:?}", addr);
+    debug!("[TX {txid}]\nconnecting to {:?}", addr);
     let mut stream = match &addr {
         NetworkAddress::Ip(sa) => {
             let target = (sa.ip().to_string(), sa.port());
@@ -626,9 +627,9 @@ async fn deliver_poop_tx(
         .await
         .map_err(|_| anyhow::anyhow!("timeout connecting to {}", host))??,
     };
-    eprintln!("[TX {txid}]\nconnected to {:?}", addr);
+    debug!("[TX {txid}]\nconnected to {:?}", addr);
 
-    eprintln!("[TX {txid}]\nsending version to {:?}", addr);
+    debug!("[TX {txid}]\nsending version to {:?}", addr);
     if let Err(e) = send_msg(&mut stream, NetworkMessage::Version(build_version_msg(relay))).await {
         return Err(e);
     }
@@ -665,24 +666,24 @@ async fn deliver_poop_tx(
 
     let libre_flag_check = ServiceFlags::from(NODE_LIBRE_RELAY);
     if !peer_version_message.services.has(libre_flag_check) {
-        eprintln!(
+        debug!(
             "[TX {txid}] {:?}\ndoes not advertise NODE_LIBRE_RELAY,\nskipping",
             addr
         );
         return Ok(false);
     }
 
-    eprintln!("[TX {txid}]\nsending verack to {:?}", addr);
+    debug!("[TX {txid}]\nsending verack to {:?}", addr);
     if let Err(e) = send_msg(&mut wr, NetworkMessage::Verack).await {
         return Err(e);
     }
 
-    eprintln!("[TX {txid}]\nsending tx to {:?}", addr);
+    debug!("[TX {txid}]\nsending tx to {:?}", addr);
     if let Err(e) = send_msg(&mut wr, NetworkMessage::Tx(tx.clone())).await {
         return Err(e);
     }
 
-    eprintln!("[TX {txid}]\nsending getdata to {:?}", addr);
+    debug!("[TX {txid}]\nsending getdata to {:?}", addr);
     if let Err(e) = send_msg(
         &mut wr,
         NetworkMessage::GetData(vec![Inventory::Transaction(txid)]),
