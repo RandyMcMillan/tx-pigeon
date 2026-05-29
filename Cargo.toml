@@ -51,6 +51,8 @@ libp2p = { version = "0.54.1", features = [
   "yamux",
 ] }
 rand = "0.9.1"
+reqwest = { version = "0.12.22", default-features = false, features = ["rustls-tls", "json", "socks"] }
+serde = { version = "1.0", features = ["derive"] }
 sha3 = "0.10.8"
 tokio = { version = "1", features = ["full"] }
 tor-rtcompat = { version = "0.30", features = ["tokio"] }
