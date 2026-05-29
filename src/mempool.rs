@@ -5,8 +5,11 @@ use std::{collections::HashSet, time::Duration};
 use tracing::{info, warn};
 
 const MEMPOOL_RECENT_URL: &str = "https://mempool.space/api/mempool/recent";
+const MEMPOOL_TX_HEX_URL: &str = "https://mempool.space/api/tx/{txid}/hex";
 const MEMPOOL_ONION_URL: &str =
     "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api/mempool/recent";
+const MEMPOOL_ONION_TX_HEX_URL: &str =
+    "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api/tx/{txid}/hex";
 
 #[derive(Debug, Deserialize)]
 struct MempoolRecentTx {
@@ -19,10 +22,24 @@ pub async fn fetch_recent_txids(limit: usize) -> Result<Vec<String>> {
         .build()?;
     let tor_client = build_tor_client().ok();
 
+    info!(
+        source = "mempool.space",
+        url = MEMPOOL_RECENT_URL,
+        limit,
+        "requesting recent mempool txids"
+    );
     let clearnet_fut = fetch_from_source(&clearnet_client, MEMPOOL_RECENT_URL, "mempool.space");
     let onion_fut = async {
         match tor_client.as_ref() {
-            Some(client) => Some(fetch_from_source(client, MEMPOOL_ONION_URL, "mempool onion").await),
+            Some(client) => {
+                info!(
+                    source = "mempool onion",
+                    url = MEMPOOL_ONION_URL,
+                    limit,
+                    "requesting recent mempool txids"
+                );
+                Some(fetch_from_source(client, MEMPOOL_ONION_URL, "mempool onion").await)
+            }
             None => None,
         }
     };
@@ -40,11 +57,45 @@ pub async fn fetch_recent_txids(limit: usize) -> Result<Vec<String>> {
         warn!("mempool onion fetch skipped because no Tor SOCKS proxy was available");
     }
 
+    info!(
+        merged_count = merged.len(),
+        limit,
+        "combined recent mempool txids from available sources"
+    );
     Ok(merged)
 }
 
+pub async fn fetch_recent_tx_hexes(limit: usize) -> Result<Vec<(String, String)>> {
+    let txids = fetch_recent_txids(limit).await?;
+    let clearnet_client = Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?;
+    let tor_client = build_tor_client().ok();
+    let mut txs = Vec::new();
+
+    for txid in txids {
+        match fetch_tx_hex(&clearnet_client, &txid, MEMPOOL_TX_HEX_URL, "mempool.space").await {
+            Ok(tx_hex) => txs.push((txid, tx_hex)),
+            Err(err) => {
+                warn!(txid = %txid, error = %err, "clearnet tx hex fetch failed");
+                if let Some(client) = tor_client.as_ref() {
+                    match fetch_tx_hex(client, &txid, MEMPOOL_ONION_TX_HEX_URL, "mempool onion").await {
+                        Ok(tx_hex) => txs.push((txid, tx_hex)),
+                        Err(onion_err) => {
+                            warn!(txid = %txid, error = %onion_err, "onion tx hex fetch failed");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    info!(count = txs.len(), "fetched recent transaction hexes");
+    Ok(txs)
+}
+
 async fn fetch_from_source(client: &Client, url: &str, label: &str) -> Result<Vec<String>> {
-    let txids = client
+    let txids: Vec<String> = client
         .get(url)
         .send()
         .await?
@@ -55,8 +106,27 @@ async fn fetch_from_source(client: &Client, url: &str, label: &str) -> Result<Ve
         .map(|entry| entry.txid)
         .collect();
 
-    info!(source = label, "fetched recent mempool txids");
+    info!(
+        source = label,
+        url,
+        count = txids.len(),
+        "fetched recent mempool txids"
+    );
     Ok(txids)
+}
+
+async fn fetch_tx_hex(client: &Client, txid: &str, template: &str, label: &str) -> Result<String> {
+    let url = template.replace("{txid}", txid);
+    let tx_hex = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
+
+    info!(source = label, txid, url, "fetched transaction hex");
+    Ok(tx_hex.trim().to_string())
 }
 
 fn merge_recent(
@@ -68,6 +138,7 @@ fn merge_recent(
 ) {
     match result {
         Ok(txids) => {
+            let before = merged.len();
             for txid in txids.into_iter().take(limit) {
                 if merged.len() >= limit {
                     break;
@@ -76,6 +147,13 @@ fn merge_recent(
                     merged.push(txid);
                 }
             }
+            info!(
+                source = label,
+                returned = merged.len().saturating_sub(before),
+                total = merged.len(),
+                limit,
+                "merged recent mempool txids"
+            );
         }
         Err(err) => {
             warn!(source = label, error = %err, "failed to fetch recent mempool txids");

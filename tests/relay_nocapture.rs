@@ -1,7 +1,12 @@
 use std::time::Duration;
 
 use bitcoin::consensus::Encodable;
-use tx_pigeon::{blast_transaction_hex, fetch_transactions, mempool::fetch_recent_txids, topic::run_topic_network};
+use tx_pigeon::{
+    blast_transaction_hex,
+    fetch_transactions,
+    mempool::fetch_recent_tx_hexes,
+    topic::{spawn_topic_network, TopicRelayHandle},
+};
 use tokio::time::{interval, MissedTickBehavior, sleep};
 
 const SEED_TX_HEX: &str = concat!(
@@ -36,13 +41,22 @@ async fn relay_nocapture_60_seconds() {
 
     let mut topic_nodes = Vec::new();
     for node_id in 1..=3 {
-        let seed_tx = (node_id == 1).then_some(SEED_TX_HEX.to_string());
-        topic_nodes.push(tokio::spawn(topic_node(node_id, tor_only, seed_tx)));
+        println!("[topic-{node_id}] booting libp2p relay node (seed_tx={})", node_id == 1);
+        let handle = spawn_topic_network(tor_only)
+            .await
+            .expect("start topic relay network");
+        topic_nodes.push(handle);
     }
 
     // Give mDNS a moment to discover the other relay nodes before the first
     // transaction publish kicks off.
     sleep(Duration::from_secs(3)).await;
+
+    println!("[topic-1] seeding topic mesh with bootstrap tx");
+    topic_nodes[0]
+        .publish(SEED_TX_HEX.to_string())
+        .await
+        .expect("seed topic mesh");
 
     let mut workers = Vec::new();
     for worker_id in 1..=3 {
@@ -53,6 +67,7 @@ async fn relay_nocapture_60_seconds() {
             limit,
             tor_only,
             relay,
+            topic_nodes[worker_id as usize - 1].clone(),
         )));
     }
 
@@ -60,24 +75,7 @@ async fn relay_nocapture_60_seconds() {
         let _ = worker.await;
     }
 
-    for node in topic_nodes {
-        node.abort();
-        let _ = node.await;
-    }
-
     println!("[relay-swarm] finished visible relay swarm test");
-}
-
-// The topic network is intentionally fire-and-forget here; the relay workers
-// only need a live peer set, not a return value.
-async fn topic_node(worker_id: usize, tor_only: bool, seed_tx: Option<String>) {
-    println!(
-        "[topic-{worker_id}] booting libp2p relay node (seed_tx={})",
-        seed_tx.is_some()
-    );
-
-    let result = run_topic_network(seed_tx, tor_only).await;
-    println!("[topic-{worker_id}] libp2p relay node exited: {result:?}");
 }
 
 // Each worker staggers startup slightly, then repeats the fetch/blast cycle so
@@ -89,6 +87,7 @@ async fn relay_worker(
     limit: usize,
     tor_only: bool,
     relay: bool,
+    topic: TopicRelayHandle,
 ) {
     let mut ticker = interval(Duration::from_secs(interval_secs));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -102,29 +101,61 @@ async fn relay_worker(
 
     for tick in 1..=ticks {
         ticker.tick().await;
-        println!("[relay-{worker_id}] tick {}/{} - requesting bitcoin nodes", tick, ticks);
+        println!("[relay-{worker_id}] tick {}/{} - requesting mempool txs", tick, ticks);
 
-        let node_fut = fetch_transactions(limit, tor_only, relay);
-        let mempool_fut = fetch_recent_txids(limit);
-        let (node_result, mempool_result) = tokio::join!(node_fut, mempool_fut);
-
+        let mempool_result = fetch_recent_tx_hexes(limit).await;
         match mempool_result {
-            Ok(txids) => {
+            Ok(txs) => {
                 println!(
-                    "[relay-{worker_id}] tick {}/{} - mempool sources returned {} recent txids",
+                    "[relay-{worker_id}] tick {}/{} - mempool sources returned {} recent txs",
                     tick,
                     ticks,
-                    txids.len()
+                    txs.len()
                 );
-                for (index, txid) in txids.iter().enumerate() {
+                for (index, (txid, tx_hex)) in txs.iter().enumerate() {
                     println!(
                         "[relay-{worker_id}] tick {}/{} - mempool tx {}/{} {}",
                         tick,
                         ticks,
                         index + 1,
-                        txids.len(),
+                        txs.len(),
                         txid
                     );
+                    println!(
+                        "[relay-{worker_id}] tick {}/{} - starting p2p transmission for {}",
+                        tick, ticks, txid
+                    );
+                    if let Err(err) = topic.publish(tx_hex.to_string()).await {
+                        println!(
+                            "[relay-{worker_id}] tick {}/{} - topic publish error for {}: {}",
+                            tick, ticks, txid, err
+                        );
+                    } else {
+                        println!(
+                            "[relay-{worker_id}] tick {}/{} - topic mesh received {}",
+                            tick, ticks, txid
+                        );
+                    }
+                    match blast_transaction_hex(tx_hex, tor_only, relay).await {
+                        Ok(peer_count) if peer_count > 0 => {
+                            println!(
+                                "[relay-{worker_id}] tick {}/{} - peer acknowledged receipt for {} via {} peers",
+                                tick, ticks, txid, peer_count
+                            );
+                        }
+                        Ok(_) => {
+                            println!(
+                                "[relay-{worker_id}] tick {}/{} - no peer acknowledged receipt for {}",
+                                tick, ticks, txid
+                            );
+                        }
+                        Err(err) => {
+                            println!(
+                                "[relay-{worker_id}] tick {}/{} - blast error for {}: {}",
+                                tick, ticks, txid, err
+                            );
+                        }
+                    }
                 }
             }
             Err(err) => {
@@ -134,6 +165,9 @@ async fn relay_worker(
                 );
             }
         }
+
+        println!("[relay-{worker_id}] tick {}/{} - requesting bitcoin nodes", tick, ticks);
+        let node_result = fetch_transactions(limit, tor_only, relay).await;
 
         match node_result {
             Ok(txs) => {
@@ -164,11 +198,36 @@ async fn relay_worker(
                         "[relay-{worker_id}] tick {}/{} - sending tx {} to peers",
                         tick, ticks, txid
                     );
-                    if let Err(err) = blast_transaction_hex(&tx_hex, tor_only, relay).await {
+                    if let Err(err) = topic.publish(tx_hex.clone()).await {
                         println!(
-                            "[relay-{worker_id}] tick {}/{} - blast error for {}: {}",
+                            "[relay-{worker_id}] tick {}/{} - topic publish error for {}: {}",
                             tick, ticks, txid, err
                         );
+                    } else {
+                        println!(
+                            "[relay-{worker_id}] tick {}/{} - topic mesh received {}",
+                            tick, ticks, txid
+                        );
+                    }
+                    match blast_transaction_hex(&tx_hex, tor_only, relay).await {
+                        Ok(peer_count) if peer_count > 0 => {
+                            println!(
+                                "[relay-{worker_id}] tick {}/{} - peer acknowledged receipt for {} via {} peers",
+                                tick, ticks, txid, peer_count
+                            );
+                        }
+                        Ok(_) => {
+                            println!(
+                                "[relay-{worker_id}] tick {}/{} - no peer acknowledged receipt for {}",
+                                tick, ticks, txid
+                            );
+                        }
+                        Err(err) => {
+                            println!(
+                                "[relay-{worker_id}] tick {}/{} - blast error for {}: {}",
+                                tick, ticks, txid, err
+                            );
+                        }
                     }
                 }
             }

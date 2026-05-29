@@ -7,6 +7,7 @@ use libp2p::{
 };
 use sha3::{Digest, Sha3_256};
 use std::collections::HashSet;
+use tokio::sync::mpsc;
 use tokio::signal;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, info, warn};
@@ -23,48 +24,8 @@ struct TopicBehaviour {
 }
 
 pub async fn run_topic_network(tx_hex: Option<String>, tor_only: bool) -> Result<()> {
+    let (mut swarm, topic) = build_topic_swarm()?;
     let mut seen_txs = HashSet::new();
-    let mut swarm = SwarmBuilder::with_new_identity()
-        .with_tokio()
-        .with_tcp(
-            Default::default(),
-            (libp2p::tls::Config::new, libp2p::noise::Config::new),
-            libp2p::yamux::Config::default,
-        )?
-        .with_behaviour(|keypair| {
-            let peer_id = keypair.public().to_peer_id();
-            debug!("peer_id={}", peer_id);
-            let topic_name = BITCOIN_PIGEON_TOPIC.to_owned();
-
-            let mut config = gossipsub::ConfigBuilder::default();
-            config.validation_mode(gossipsub::ValidationMode::Anonymous);
-            config.message_id_fn(move |message: &gossipsub::Message| {
-                tx_message_id(message, &topic_name)
-            });
-            let config = config
-                .build()
-                .map_err(|e| anyhow::anyhow!("failed to build gossipsub config: {e}"))?;
-
-            let gossipsub = gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, config)
-                .map_err(|e| anyhow::anyhow!("failed to build gossipsub behaviour: {e}"))?;
-            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
-                .map_err(|e| anyhow::anyhow!("failed to build mdns behaviour: {e}"))?;
-
-            Ok(TopicBehaviour { gossipsub, mdns })
-        })?
-        .build();
-
-    let topic = gossipsub::IdentTopic::new(BITCOIN_PIGEON_TOPIC);
-    swarm
-        .behaviour_mut()
-        .gossipsub
-        .subscribe(&topic)
-        .context("failed to subscribe to bitcoin-pigeon topic")?;
-
-    swarm
-        .listen_on("/ip4/0.0.0.0/tcp/0".parse::<Multiaddr>()?)
-        .context("failed to start listening")?;
-
     if let Some(tx_hex) = tx_hex {
         publish_topic_tx(&mut swarm, &topic, tx_hex, tor_only, &mut seen_txs).await?;
     }
@@ -119,6 +80,132 @@ pub async fn run_topic_network(tx_hex: Option<String>, tor_only: bool) -> Result
     }
 
     Ok(())
+}
+
+#[derive(Clone)]
+pub struct TopicRelayHandle {
+    publish_tx: mpsc::Sender<String>,
+}
+
+impl TopicRelayHandle {
+    pub async fn publish(&self, tx_hex: String) -> Result<()> {
+        self.publish_tx
+            .send(tx_hex)
+            .await
+            .context("failed to queue topic publish")
+    }
+}
+
+pub async fn spawn_topic_network(tor_only: bool) -> Result<TopicRelayHandle> {
+    let (mut swarm, topic) = build_topic_swarm()?;
+    let (publish_tx, mut publish_rx) = mpsc::channel::<String>(64);
+    let mut seen_txs = HashSet::new();
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                event = swarm.select_next_some() => match event {
+                    SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                        propagation_source,
+                        message_id,
+                        message,
+                    })) => {
+                        info!(?propagation_source, %message_id, "received bitcoin-pigeon topic message");
+                        if let Err(err) = handle_topic_tx(&message.data, tor_only, &mut seen_txs).await {
+                            warn!(error = %err, "failed to handle topic tx");
+                        }
+                    }
+                    SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
+                        info!(?peer_id, %topic, "peer subscribed to bitcoin-pigeon");
+                    }
+                    SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
+                        info!(?peer_id, %topic, "peer unsubscribed from bitcoin-pigeon");
+                    }
+                    SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::GossipsubNotSupported { peer_id })) => {
+                        warn!(?peer_id, "peer does not support gossipsub");
+                    }
+                    SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                        for (peer_id, addr) in list {
+                            info!(?peer_id, ?addr, "mdns discovered peer");
+                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                            if let Err(err) = swarm.dial(addr.clone()) {
+                                warn!(?peer_id, ?addr, "failed to dial discovered peer: {err}");
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                        for (peer_id, addr) in list {
+                            info!(?peer_id, ?addr, "mdns expired peer");
+                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                        }
+                    }
+                    SwarmEvent::NewListenAddr { address, .. } => {
+                        info!(?address, "listening for bitcoin-pigeon peers");
+                    }
+                    other => {
+                        info!(?other, "swarm event");
+                    }
+                },
+                maybe_tx_hex = publish_rx.recv() => {
+                    match maybe_tx_hex {
+                        Some(tx_hex) => {
+                            if let Err(err) = publish_topic_tx(&mut swarm, &topic, tx_hex, tor_only, &mut seen_txs).await {
+                                warn!(error = %err, "failed to publish queued topic tx");
+                            }
+                        }
+                        None => break,
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(TopicRelayHandle { publish_tx })
+}
+
+fn build_topic_swarm() -> Result<(Swarm<TopicBehaviour>, gossipsub::IdentTopic)> {
+    let mut swarm = SwarmBuilder::with_new_identity()
+        .with_tokio()
+        .with_tcp(
+            Default::default(),
+            (libp2p::tls::Config::new, libp2p::noise::Config::new),
+            libp2p::yamux::Config::default,
+        )?
+        .with_behaviour(|keypair| {
+            let peer_id = keypair.public().to_peer_id();
+            debug!("peer_id={}", peer_id);
+            let topic_name = BITCOIN_PIGEON_TOPIC.to_owned();
+
+            let mut config = gossipsub::ConfigBuilder::default();
+            config.validation_mode(gossipsub::ValidationMode::Anonymous);
+            config.message_id_fn(move |message: &gossipsub::Message| {
+                tx_message_id(message, &topic_name)
+            });
+            let config = config
+                .build()
+                .map_err(|e| anyhow::anyhow!("failed to build gossipsub config: {e}"))?;
+
+            let gossipsub = gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, config)
+                .map_err(|e| anyhow::anyhow!("failed to build gossipsub behaviour: {e}"))?;
+            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+                .map_err(|e| anyhow::anyhow!("failed to build mdns behaviour: {e}"))?;
+
+            Ok(TopicBehaviour { gossipsub, mdns })
+        })?
+        .build();
+
+    let topic = gossipsub::IdentTopic::new(BITCOIN_PIGEON_TOPIC);
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .subscribe(&topic)
+        .context("failed to subscribe to bitcoin-pigeon topic")?;
+
+    swarm
+        .listen_on("/ip4/0.0.0.0/tcp/0".parse::<Multiaddr>()?)
+        .context("failed to start listening")?;
+
+    Ok((swarm, topic))
 }
 
 async fn publish_topic_tx(
