@@ -26,10 +26,11 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
+    signal,
     net::lookup_host,
     sync::Semaphore,
     task::JoinSet,
-    time::timeout,
+    time::{MissedTickBehavior, interval, timeout},
 };
 use tracing::{error, info};
 use tor_rtcompat::PreferredRuntime;
@@ -80,95 +81,14 @@ pub async fn blast_transaction_hex(tx_hex: &str, tor_only: bool, relay: bool) ->
 pub async fn blast_transaction(tx: Transaction, _tor_only: bool, relay: bool) -> Result<usize> {
     let txid = tx.compute_txid();
 
-    let mut seed_addrs = Vec::new();
-    let mut seed_tasks = JoinSet::new();
-
-    for seed_host in DNS_SEEDS {
-        info!("fetching addrs from {:?}", seed_host);
-
-        let host = seed_host.to_owned();
-
-        seed_tasks.spawn(async move {
-            let lookup = lookup_host(format!("{}:8333", seed_host));
-
-            match timeout(Duration::from_secs(2), lookup).await {
-                Ok(Ok(addrs)) => {
-                    let addrs: Vec<_> = addrs.collect();
-                    Ok((host, addrs))
-                }
-                Ok(Err(e)) => Err(anyhow::Error::new(e)),
-                Err(_) => {
-                    error!("Timeout while looking up {}", seed_host);
-                    Err(anyhow::anyhow!("Timeout"))
-                }
-            }
-        });
-    }
-
-    while let Some(res) = seed_tasks.join_next().await {
-        match res {
-            Ok(Ok((host, addresses))) => {
-                info!("{} returned {} IPs", host, addresses.len());
-                seed_addrs.extend(addresses);
-            }
-            Ok(Err(crawl_error)) => {
-                error!("dns seed node error: {crawl_error},");
-            }
-            Err(join_error) => {
-                error!("join error during dns seed: {join_error}");
-            }
-        }
-    }
-
-    info!("found {} seed node addresses", seed_addrs.len());
-    seed_addrs.shuffle(&mut rand::rng());
+    let libre_peers = discover_libre_peers().await?;
 
     info!("time to blast some nodes with pigeon poop! 🐦💩");
     info!("blasting tx {:?} to libre relay nodes...", txid);
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES));
 
-    let mut libre_peers = HashSet::<NetworkAddress>::new();
-    let mut crawl_tasks = JoinSet::new();
-
-    for addr in seed_addrs.clone() {
-        crawl_tasks.spawn({
-            let sem = semaphore.clone();
-            async move {
-                let _permit = sem.acquire_owned().await?;
-                crawl_seed_node(&addr).await
-            }
-        });
-    }
-
-    while let Some(res) = crawl_tasks.join_next().await {
-        match res {
-            Ok(Ok(addresses)) => {
-                libre_peers.extend(addresses);
-            }
-            Ok(Err(crawl_error)) => {
-                error!("crawl seed node error: {}", crawl_error);
-            }
-            Err(join_error) => {
-                error!("join error during crawl: {}", join_error);
-            }
-        }
-    }
-
-    info!(
-        "found {} addresses advertising the libre relay service flag",
-        libre_peers.len()
-    );
-
-    let libre_peers = if tor_only_enabled() {
-        info!("Tor-only mode enabled; filtering clearnet peers");
-        libre_peers
-            .into_iter()
-            .filter(|addr| matches!(addr, NetworkAddress::Onion(_)))
-            .collect()
-    } else {
-        libre_peers
-    };
+    let libre_peers = filter_peers_for_tor_only(libre_peers);
 
     info!("using {} peers after tor-only filtering", libre_peers.len());
 
@@ -247,6 +167,106 @@ pub async fn blast_transaction(tx: Transaction, _tor_only: bool, relay: bool) ->
     Ok(success_count)
 }
 
+pub async fn fetch_transactions(limit: usize, tor_only: bool, relay: bool) -> Result<Vec<Transaction>> {
+    set_tor_only(tor_only);
+    let libre_peers = discover_libre_peers().await?;
+
+    info!("time to fetch some nodes with pigeon poop! 🐦💩");
+    info!("requesting transactions from libre relay peers...");
+
+    let libre_peers = filter_peers_for_tor_only(libre_peers);
+    info!("using {} peers after tor-only filtering", libre_peers.len());
+
+    info!("Bootstrapping Tor client...");
+    let config = TorClientConfig::builder().build()?;
+    let tor_client = Arc::new(TorClient::create_bootstrapped(config).await?);
+
+    let common_token = IsolationToken::no_isolation();
+    let mut prefs = StreamPrefs::new();
+    prefs.set_isolation(common_token);
+
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES));
+    let mut peer_tasks = JoinSet::new();
+
+    for peer_addr in libre_peers {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let tor_client = tor_client.clone();
+        let prefs = prefs.clone();
+        peer_tasks.spawn(async move {
+            let _permit_guard = permit;
+            fetch_peer_transactions(peer_addr, tor_client, prefs, relay, limit).await
+        });
+    }
+
+    let mut fetched_txs = Vec::new();
+    let mut seen_txids = HashSet::new();
+
+    while let Some(res) = peer_tasks.join_next().await {
+        match res {
+            Ok(Ok(peer_txs)) => {
+                for tx in peer_txs {
+                    if fetched_txs.len() >= limit {
+                        break;
+                    }
+
+                    let txid = tx.compute_txid();
+                    if seen_txids.insert(txid) {
+                        fetched_txs.push(tx);
+                    }
+                }
+            }
+            Ok(Err(fetch_error)) => {
+                error!("peer fetch error: {fetch_error}");
+            }
+            Err(join_error) => {
+                error!("join error during tx fetch: {}", join_error);
+            }
+        }
+    }
+
+    info!(count = fetched_txs.len(), "finished fetching transactions from peers");
+    Ok(fetched_txs)
+}
+
+pub async fn relay_transactions(
+    limit: usize,
+    tor_only: bool,
+    relay: bool,
+    interval_secs: u64,
+) -> Result<()> {
+    let mut seen_txids = HashSet::<bitcoin::Txid>::new();
+    let mut ticker = interval(Duration::from_secs(interval_secs));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                info!(interval_secs, "running p2p relay cycle");
+                let txs = fetch_transactions(limit, tor_only, relay).await?;
+                info!(count = txs.len(), "relay cycle fetched transactions");
+
+                for tx in txs {
+                    let txid = tx.compute_txid();
+                    if !seen_txids.insert(txid) {
+                        info!(%txid, "already relayed this tx");
+                        continue;
+                    }
+
+                    let tx_hex = encode_transaction_hex(&tx)?;
+                    info!(%txid, "rebroadcasting fetched tx p2p");
+                    blast_transaction_hex(&tx_hex, tor_only, relay).await?;
+                }
+            }
+            _ = signal::ctrl_c() => {
+                info!("stopping p2p relay loop");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn build_version_msg(relay: bool) -> VersionMessage {
     VersionMessage {
         version: 70016,
@@ -268,6 +288,302 @@ fn build_version_msg(relay: bool) -> VersionMessage {
         start_height: 897157,
         relay,
     }
+}
+
+fn encode_transaction_hex(tx: &Transaction) -> Result<String> {
+    let mut bytes = Vec::new();
+    tx.consensus_encode(&mut bytes)?;
+    Ok(hex::encode(bytes))
+}
+
+async fn discover_libre_peers() -> Result<HashSet<NetworkAddress>> {
+    let mut seed_addrs = Vec::new();
+    let mut seed_tasks = JoinSet::new();
+
+    for seed_host in DNS_SEEDS {
+        info!("fetching addrs from {:?}", seed_host);
+
+        let host = seed_host.to_owned();
+
+        seed_tasks.spawn(async move {
+            let lookup = lookup_host(format!("{}:8333", seed_host));
+
+            match timeout(Duration::from_secs(2), lookup).await {
+                Ok(Ok(addrs)) => {
+                    let addrs: Vec<_> = addrs.collect();
+                    Ok((host, addrs))
+                }
+                Ok(Err(e)) => Err(anyhow::Error::new(e)),
+                Err(_) => {
+                    error!("Timeout while looking up {}", seed_host);
+                    Err(anyhow::anyhow!("Timeout"))
+                }
+            }
+        });
+    }
+
+    while let Some(res) = seed_tasks.join_next().await {
+        match res {
+            Ok(Ok((host, addresses))) => {
+                info!("{} returned {} IPs", host, addresses.len());
+                seed_addrs.extend(addresses);
+            }
+            Ok(Err(crawl_error)) => {
+                error!("dns seed node error: {crawl_error},");
+            }
+            Err(join_error) => {
+                error!("join error during dns seed: {join_error}");
+            }
+        }
+    }
+
+    info!("found {} seed node addresses", seed_addrs.len());
+    seed_addrs.shuffle(&mut rand::rng());
+
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES));
+    let mut libre_peers = HashSet::<NetworkAddress>::new();
+    let mut crawl_tasks = JoinSet::new();
+
+    for addr in seed_addrs {
+        crawl_tasks.spawn({
+            let sem = semaphore.clone();
+            async move {
+                let _permit = sem.acquire_owned().await?;
+                crawl_seed_node(&addr).await
+            }
+        });
+    }
+
+    while let Some(res) = crawl_tasks.join_next().await {
+        match res {
+            Ok(Ok(addresses)) => {
+                libre_peers.extend(addresses);
+            }
+            Ok(Err(crawl_error)) => {
+                error!("crawl seed node error: {}", crawl_error);
+            }
+            Err(join_error) => {
+                error!("join error during crawl: {}", join_error);
+            }
+        }
+    }
+
+    info!(
+        "found {} addresses advertising the libre relay service flag",
+        libre_peers.len()
+    );
+
+    Ok(libre_peers)
+}
+
+fn filter_peers_for_tor_only(peers: HashSet<NetworkAddress>) -> HashSet<NetworkAddress> {
+    if tor_only_enabled() {
+        info!("Tor-only mode enabled; filtering clearnet peers");
+        peers
+            .into_iter()
+            .filter(|addr| matches!(addr, NetworkAddress::Onion(_)))
+            .collect()
+    } else {
+        peers
+    }
+}
+
+async fn fetch_peer_transactions(
+    addr: NetworkAddress,
+    tor_client: Arc<TorClient<PreferredRuntime>>,
+    prefs: StreamPrefs,
+    relay: bool,
+    limit: usize,
+) -> Result<Vec<Transaction>> {
+    if tor_only_enabled() && matches!(addr, NetworkAddress::Ip(_)) {
+        eprintln!("[FETCH] tor-only enabled; skipping {:?}", addr);
+        return Ok(Vec::new());
+    }
+
+    eprintln!("[FETCH] connecting to {:?}", addr);
+    let mut stream = match &addr {
+        NetworkAddress::Ip(sa) => {
+            let target = (sa.ip().to_string(), sa.port());
+
+            timeout(
+                CONNECTION_TIMEOUT,
+                tor_client.connect_with_prefs(target, &prefs),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("timeout connecting to {}", sa))??
+        }
+        NetworkAddress::Onion(host) => timeout(
+            CONNECTION_TIMEOUT,
+            tor_client.connect_with_prefs((host.as_str(), 8333), &prefs),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("timeout connecting to {}", host))??,
+    };
+    eprintln!("[FETCH] connected to {:?}", addr);
+
+    eprintln!("[FETCH] sending version to {:?}", addr);
+    send_msg(&mut stream, NetworkMessage::Version(build_version_msg(relay))).await?;
+
+    let (mut rd, mut wr) = stream.split();
+    let peer_version_message = wait_for_version(&mut rd, &addr).await?;
+
+    eprintln!("[FETCH] sending verack to {:?}", addr);
+    send_msg(&mut wr, NetworkMessage::Verack).await?;
+
+    eprintln!("[FETCH] requesting mempool from {:?}", addr);
+    send_msg(&mut wr, NetworkMessage::MemPool).await?;
+
+    let mut announced = HashSet::<bitcoin::Txid>::new();
+    let mut request_list = Vec::<bitcoin::Txid>::new();
+    loop {
+        match timeout(CONNECTION_TIMEOUT, read_msg(&mut rd)).await {
+            Ok(Ok(m)) => match m.payload() {
+                NetworkMessage::Inv(inv_list) => {
+                    info!(
+                        "[FETCH] {:?} (UA: '{}') advertised {} inventory entries",
+                        addr,
+                        peer_version_message.user_agent,
+                        inv_list.len()
+                    );
+                    for inv in inv_list {
+                        if let Inventory::Transaction(hash) = inv {
+                            if announced.insert(*hash) {
+                                info!(
+                                    "[FETCH] {:?} queued tx {} for getdata",
+                                    addr,
+                                    hash
+                                );
+                                request_list.push(*hash);
+                                if request_list.len() >= limit {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if request_list.len() >= limit {
+                        break;
+                    }
+                }
+                NetworkMessage::NotFound(_) => {}
+                _ => {}
+            },
+            Ok(Err(read_err)) => {
+                error!(
+                    "Read error from {:?} while awaiting mempool invs: {} (UA: '{}')",
+                    addr, read_err, peer_version_message.user_agent
+                );
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+
+    if request_list.is_empty() {
+        info!(
+            "[FETCH] {:?} (UA: '{}') returned no tx inventory",
+            addr, peer_version_message.user_agent
+        );
+        return Ok(Vec::new());
+    }
+
+    eprintln!(
+        "[FETCH] requesting {} txs from {:?}",
+        request_list.len(),
+        addr
+    );
+    info!(
+        "[FETCH] {:?} (UA: '{}') sending getdata for {:?}",
+        addr,
+        peer_version_message.user_agent,
+        request_list
+    );
+    send_msg(
+        &mut wr,
+        NetworkMessage::GetData(
+            request_list
+                .iter()
+                .map(|txid| Inventory::Transaction(*txid))
+                .collect(),
+        ),
+    )
+    .await?;
+
+    let mut fetched = Vec::<Transaction>::new();
+    let mut fetched_ids = HashSet::<bitcoin::Txid>::new();
+    let mut pending_txids = request_list.iter().copied().collect::<HashSet<_>>();
+    while !pending_txids.is_empty() && fetched.len() < limit {
+        match timeout(CONNECTION_TIMEOUT, read_msg(&mut rd)).await {
+            Ok(Ok(m)) => match m.payload() {
+                NetworkMessage::Tx(received_tx) => {
+                    let received_txid = received_tx.compute_txid();
+                    if pending_txids.remove(&received_txid) && fetched_ids.insert(received_txid) {
+                        info!(
+                            "[FETCH HIT] {:?} (UA: '{}') sent tx {} ({} of {})",
+                            addr,
+                            peer_version_message.user_agent,
+                            received_txid,
+                            fetched.len() + 1,
+                            limit
+                        );
+                        fetched.push(received_tx.clone());
+                    }
+                }
+                NetworkMessage::NotFound(not_found_list) => {
+                    for inv in not_found_list {
+                        if let Inventory::Transaction(hash) = inv {
+                            pending_txids.remove(hash);
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Ok(Err(read_err)) => {
+                error!(
+                    "Read error from {:?} while awaiting tx data: {} (UA: '{}')",
+                    addr, read_err, peer_version_message.user_agent
+                );
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+
+    Ok(fetched)
+}
+
+async fn wait_for_version(
+    rd: &mut (impl tokio::io::AsyncRead + Unpin),
+    addr: &NetworkAddress,
+) -> Result<VersionMessage> {
+    let peer_version_message = match timeout(Duration::from_secs(5), async {
+        loop {
+            match read_msg(rd).await {
+                Ok(raw_msg) => {
+                    if let NetworkMessage::Version(version) = raw_msg.payload() {
+                        break Ok::<VersionMessage, anyhow::Error>(version.clone());
+                    }
+                }
+                Err(e) => {
+                    break Err(e);
+                }
+            }
+        }
+    })
+    .await
+    {
+        Ok(Ok(vm)) => vm,
+        Ok(Err(e)) => {
+            return Err(e);
+        }
+        Err(_) => {
+            return Err(anyhow::anyhow!(
+                "Timeout waiting for peer Version from {:?}",
+                addr
+            ));
+        }
+    };
+
+    Ok(peer_version_message)
 }
 
 async fn deliver_poop_tx(
