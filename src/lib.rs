@@ -484,6 +484,18 @@ mod tests {
             Some("arti")
         );
     }
+
+    #[test]
+    fn different_run_ids_produce_different_state_dirs() {
+        let first = arti_state_dir(1_717_000_000).expect("first state dir");
+        let second = arti_state_dir(1_717_000_001).expect("second state dir");
+
+        assert_ne!(first, second);
+        assert_ne!(
+            first.file_name().and_then(|value| value.to_str()),
+            second.file_name().and_then(|value| value.to_str())
+        );
+    }
 }
 
 fn filter_peers_for_tor_only(peers: HashSet<NetworkAddress>) -> HashSet<NetworkAddress> {
