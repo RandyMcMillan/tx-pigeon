@@ -95,11 +95,23 @@ pub async fn run_topic_network(tx_hex: Option<String>, tor_only: bool) -> Result
     Ok(())
 }
 
-pub async fn run_gossip_client(label: impl Into<String>, tor_only: bool) -> Result<()> {
+pub async fn run_gossip_client(
+    label: impl Into<String>,
+    tor_only: bool,
+    show_local: bool,
+    show_remote: bool,
+) -> Result<()> {
     let label = label.into();
     let (mut swarm, _topic) = build_topic_swarm()?;
     let mut seen_txs = HashSet::new();
     let mut mempool_tick = interval(Duration::from_secs(10));
+
+    info!(
+        %label,
+        show_local,
+        show_remote,
+        "gossip client mode selection"
+    );
 
     loop {
         tokio::select! {
@@ -108,7 +120,7 @@ pub async fn run_gossip_client(label: impl Into<String>, tor_only: bool) -> Resu
                     propagation_source,
                     message_id,
                     message,
-                })) => {
+                })) if show_remote => {
                     let txid = decode_transaction_bytes(&message.data)
                         .map(|tx| tx.compute_txid().to_string())
                         .unwrap_or_else(|_| hex::encode(&message.data));
@@ -117,19 +129,19 @@ pub async fn run_gossip_client(label: impl Into<String>, tor_only: bool) -> Resu
                         warn!(error = %err, "failed to observe topic tx");
                     }
                 }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
+                SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) if show_remote => {
                     info!(%label, ?peer_id, %topic, "gossip client subscribed");
                 }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::RelayClient(event)) => {
+                SwarmEvent::Behaviour(TopicBehaviourEvent::RelayClient(event)) if show_remote => {
                     info!(%label, ?event, "gossip client relay event");
                 }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Autonat(event)) => {
+                SwarmEvent::Behaviour(TopicBehaviourEvent::Autonat(event)) if show_remote => {
                     info!(%label, ?event, "gossip client autonat event");
                 }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Dcutr(event)) => {
+                SwarmEvent::Behaviour(TopicBehaviourEvent::Dcutr(event)) if show_remote => {
                     info!(%label, ?event, "gossip client hole punch event");
                 }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Discovered(list))) if show_remote => {
                     for (peer_id, addr) in list {
                         debug!(%label, ?peer_id, ?addr, "gossip client discovered peer");
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
@@ -138,7 +150,7 @@ pub async fn run_gossip_client(label: impl Into<String>, tor_only: bool) -> Resu
                         }
                     }
                 }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Expired(list))) if show_remote => {
                     for (peer_id, addr) in list {
                         info!(%label, ?peer_id, ?addr, "gossip client expired peer");
                         swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
@@ -148,10 +160,12 @@ pub async fn run_gossip_client(label: impl Into<String>, tor_only: bool) -> Resu
                     info!(%label, ?address, "gossip client listening for bitcoin-pigeon peers");
                 }
                 other => {
-                    info!(%label, ?other, "gossip client swarm event");
+                    if show_remote {
+                        info!(%label, ?other, "gossip client swarm event");
+                    }
                 }
             },
-            _ = mempool_tick.tick() => {
+            _ = mempool_tick.tick(), if show_local => {
                 if let Err(err) = poll_recent_transactions(&label, tor_only, &mut seen_txs).await {
                     warn!(%label, error = %err, "gossip client failed to poll recent transactions");
                 }

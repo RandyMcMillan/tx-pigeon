@@ -49,7 +49,7 @@ async fn relay_nocapture_60_seconds() {
     }
 
     let gossip_client = tokio::spawn(async move {
-        let _ = run_gossip_client("gossip-client", tor_only).await;
+        let _ = run_gossip_client("gossip-client", tor_only, true, true).await;
     });
 
     // Give mDNS a moment to discover the other relay nodes before the first

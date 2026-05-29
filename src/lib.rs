@@ -37,6 +37,7 @@ use tor_rtcompat::PreferredRuntime;
 
 pub mod topic;
 pub mod mempool;
+pub mod cli;
 
 static TOR_ONLY: AtomicBool = AtomicBool::new(false);
 
