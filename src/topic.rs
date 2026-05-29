@@ -9,10 +9,10 @@ use sha3::{Digest, Sha3_256};
 use std::collections::HashSet;
 use tokio::sync::mpsc;
 use tokio::signal;
-use tokio::time::{Duration, sleep};
+use tokio::time::{Duration, sleep, interval};
 use tracing::{debug, info, warn};
 
-use crate::mempool::fetch_recent_txids;
+use crate::mempool::{fetch_recent_tx_hexes, fetch_recent_txids};
 use crate::blast_transaction_hex;
 
 const BITCOIN_PIGEON_TOPIC: &str = "bitcoin-pigeon";
@@ -99,6 +99,7 @@ pub async fn run_gossip_client(label: impl Into<String>, tor_only: bool) -> Resu
     let label = label.into();
     let (mut swarm, _topic) = build_topic_swarm()?;
     let mut seen_txs = HashSet::new();
+    let mut mempool_tick = interval(Duration::from_secs(10));
 
     loop {
         tokio::select! {
@@ -148,6 +149,11 @@ pub async fn run_gossip_client(label: impl Into<String>, tor_only: bool) -> Resu
                 }
                 other => {
                     info!(%label, ?other, "gossip client swarm event");
+                }
+            },
+            _ = mempool_tick.tick() => {
+                if let Err(err) = poll_recent_transactions(&label, tor_only, &mut seen_txs).await {
+                    warn!(%label, error = %err, "gossip client failed to poll recent transactions");
                 }
             },
             _ = signal::ctrl_c() => {
@@ -415,6 +421,49 @@ async fn observe_topic_tx(
     info!(%label, %txid, "observed bitcoin-pigeon topic tx");
     if tor_only {
         info!(%label, %txid, "tor-only gossip watch active");
+    }
+
+    Ok(())
+}
+
+async fn poll_recent_transactions(
+    label: &str,
+    tor_only: bool,
+    seen_txs: &mut HashSet<bitcoin::Txid>,
+) -> Result<()> {
+    const RECENT_LIMIT: usize = 5;
+
+    let txs = fetch_recent_tx_hexes(RECENT_LIMIT).await?;
+    info!(
+        %label,
+        count = txs.len(),
+        "gossip client polling recent mempool transactions"
+    );
+
+    for (txid, tx_hex) in txs {
+        let tx = decode_transaction_hex(&tx_hex)?;
+        let decoded_txid = tx.compute_txid();
+
+        if decoded_txid.to_string() != txid {
+            warn!(
+                %label,
+                expected_txid = %txid,
+                decoded_txid = %decoded_txid,
+                "gossip client saw mismatched transaction ids while polling mempool"
+            );
+        }
+
+        log_deserialized_transaction(label, &tx);
+        if !seen_txs.insert(decoded_txid) {
+            info!(%label, %decoded_txid, "already polled bitcoin-pigeon tx");
+            continue;
+        }
+
+        log_local_mempool(label).await?;
+        info!(%label, %decoded_txid, "observed recent mempool tx");
+        if tor_only {
+            info!(%label, %decoded_txid, "tor-only gossip watch active");
+        }
     }
 
     Ok(())
