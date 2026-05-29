@@ -27,7 +27,7 @@ pub async fn run_topic_network(tx_hex: Option<String>, tor_only: bool) -> Result
     let (mut swarm, topic) = build_topic_swarm()?;
     let mut seen_txs = HashSet::new();
     if let Some(tx_hex) = tx_hex {
-        publish_topic_tx(&mut swarm, &topic, tx_hex, tor_only, &mut seen_txs).await?;
+        publish_topic_tx("topic-cli", &mut swarm, &topic, tx_hex, tor_only, &mut seen_txs).await?;
     }
 
     loop {
@@ -39,7 +39,7 @@ pub async fn run_topic_network(tx_hex: Option<String>, tor_only: bool) -> Result
                     message,
                 })) => {
                     info!(?propagation_source, %message_id, "received bitcoin-pigeon topic message");
-                    handle_topic_tx(&message.data, tor_only, &mut seen_txs).await?;
+                    handle_topic_tx("topic-cli", &message.data, tor_only, &mut seen_txs).await?;
                 }
                 SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
                     info!(?peer_id, %topic, "peer subscribed to bitcoin-pigeon");
@@ -96,7 +96,8 @@ impl TopicRelayHandle {
     }
 }
 
-pub async fn spawn_topic_network(tor_only: bool) -> Result<TopicRelayHandle> {
+pub async fn spawn_topic_network(label: impl Into<String>, tor_only: bool) -> Result<TopicRelayHandle> {
+    let label = label.into();
     let (mut swarm, topic) = build_topic_swarm()?;
     let (publish_tx, mut publish_rx) = mpsc::channel::<String>(64);
     let mut seen_txs = HashSet::new();
@@ -110,8 +111,11 @@ pub async fn spawn_topic_network(tor_only: bool) -> Result<TopicRelayHandle> {
                         message_id,
                         message,
                     })) => {
-                        info!(?propagation_source, %message_id, "received bitcoin-pigeon topic message");
-                        if let Err(err) = handle_topic_tx(&message.data, tor_only, &mut seen_txs).await {
+                        let txid = decode_transaction_bytes(&message.data)
+                            .map(|tx| tx.compute_txid().to_string())
+                            .unwrap_or_else(|_| hex::encode(&message.data));
+                        info!(%label, ?propagation_source, %message_id, %txid, "received bitcoin-pigeon topic message");
+                        if let Err(err) = handle_topic_tx(&label, &message.data, tor_only, &mut seen_txs).await {
                             warn!(error = %err, "failed to handle topic tx");
                         }
                     }
@@ -126,7 +130,7 @@ pub async fn spawn_topic_network(tor_only: bool) -> Result<TopicRelayHandle> {
                     }
                     SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                         for (peer_id, addr) in list {
-                            info!(?peer_id, ?addr, "mdns discovered peer");
+                            info!(%label, ?peer_id, ?addr, "mdns discovered peer");
                             swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                             if let Err(err) = swarm.dial(addr.clone()) {
                                 warn!(?peer_id, ?addr, "failed to dial discovered peer: {err}");
@@ -135,21 +139,21 @@ pub async fn spawn_topic_network(tor_only: bool) -> Result<TopicRelayHandle> {
                     }
                     SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
                         for (peer_id, addr) in list {
-                            info!(?peer_id, ?addr, "mdns expired peer");
+                            info!(%label, ?peer_id, ?addr, "mdns expired peer");
                             swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                         }
                     }
                     SwarmEvent::NewListenAddr { address, .. } => {
-                        info!(?address, "listening for bitcoin-pigeon peers");
+                        info!(%label, ?address, "listening for bitcoin-pigeon peers");
                     }
                     other => {
-                        info!(?other, "swarm event");
+                        info!(%label, ?other, "swarm event");
                     }
                 },
                 maybe_tx_hex = publish_rx.recv() => {
                     match maybe_tx_hex {
                         Some(tx_hex) => {
-                            if let Err(err) = publish_topic_tx(&mut swarm, &topic, tx_hex, tor_only, &mut seen_txs).await {
+                            if let Err(err) = publish_topic_tx(&label, &mut swarm, &topic, tx_hex, tor_only, &mut seen_txs).await {
                                 warn!(error = %err, "failed to publish queued topic tx");
                             }
                         }
@@ -209,6 +213,7 @@ fn build_topic_swarm() -> Result<(Swarm<TopicBehaviour>, gossipsub::IdentTopic)>
 }
 
 async fn publish_topic_tx(
+    label: &str,
     swarm: &mut Swarm<TopicBehaviour>,
     topic: &gossipsub::IdentTopic,
     tx_hex: String,
@@ -219,7 +224,7 @@ async fn publish_topic_tx(
     let txid = tx.compute_txid();
     let raw_bytes = hex::decode(&tx_hex).context("failed to decode transaction hex")?;
 
-    info!(%txid, "publishing transaction to bitcoin-pigeon topic");
+    info!(%label, %txid, "publishing transaction to bitcoin-pigeon topic");
     let published = publish_with_retry(swarm, topic, raw_bytes.clone(), txid).await?;
     if !published {
         warn!(
@@ -228,7 +233,7 @@ async fn publish_topic_tx(
         );
     }
 
-    handle_topic_tx(&raw_bytes, tor_only, seen_txs).await
+    handle_topic_tx(label, &raw_bytes, tor_only, seen_txs).await
 }
 
 async fn publish_with_retry(
@@ -268,6 +273,7 @@ async fn publish_with_retry(
 }
 
 async fn handle_topic_tx(
+    label: &str,
     data: &[u8],
     tor_only: bool,
     seen_txs: &mut HashSet<bitcoin::Txid>,
@@ -276,12 +282,12 @@ async fn handle_topic_tx(
     let txid = tx.compute_txid();
 
     if !seen_txs.insert(txid) {
-        info!(%txid, "already processed bitcoin-pigeon tx");
+        info!(%label, %txid, "already processed bitcoin-pigeon tx");
         return Ok(());
     }
 
     let tx_hex = hex::encode(data);
-    info!(%txid, "blasting transaction from bitcoin-pigeon topic");
+    info!(%label, %txid, "blasting transaction from bitcoin-pigeon topic");
     blast_transaction_hex(&tx_hex, tor_only, true).await?;
     Ok(())
 }

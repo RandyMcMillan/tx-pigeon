@@ -42,7 +42,7 @@ async fn relay_nocapture_60_seconds() {
     let mut topic_nodes = Vec::new();
     for node_id in 1..=3 {
         println!("[topic-{node_id}] booting libp2p relay node (seed_tx={})", node_id == 1);
-        let handle = spawn_topic_network(tor_only)
+        let handle = spawn_topic_network(format!("topic-{node_id}"), tor_only)
             .await
             .expect("start topic relay network");
         topic_nodes.push(handle);
@@ -53,10 +53,7 @@ async fn relay_nocapture_60_seconds() {
     sleep(Duration::from_secs(3)).await;
 
     println!("[topic-1] seeding topic mesh with bootstrap tx");
-    topic_nodes[0]
-        .publish(SEED_TX_HEX.to_string())
-        .await
-        .expect("seed topic mesh");
+    topic_nodes[0].publish(SEED_TX_HEX.to_string()).await.expect("seed topic mesh");
 
     let mut workers = Vec::new();
     for worker_id in 1..=3 {
