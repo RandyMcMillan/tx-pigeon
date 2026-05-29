@@ -5,7 +5,7 @@ use tx_pigeon::{
     blast_transaction_hex,
     fetch_transactions,
     mempool::fetch_recent_tx_hexes,
-    topic::{spawn_topic_network, TopicRelayHandle},
+    topic::{run_gossip_client, spawn_topic_network, TopicRelayHandle},
 };
 use tokio::time::{interval, MissedTickBehavior, sleep};
 
@@ -48,6 +48,10 @@ async fn relay_nocapture_60_seconds() {
         topic_nodes.push(handle);
     }
 
+    let gossip_client = tokio::spawn(async move {
+        let _ = run_gossip_client("gossip-client", tor_only).await;
+    });
+
     // Give mDNS a moment to discover the other relay nodes before the first
     // transaction publish kicks off.
     sleep(Duration::from_secs(3)).await;
@@ -71,6 +75,9 @@ async fn relay_nocapture_60_seconds() {
     for worker in workers {
         let _ = worker.await;
     }
+
+    gossip_client.abort();
+    let _ = gossip_client.await;
 
     println!("[relay-swarm] finished visible relay swarm test");
 }
@@ -133,6 +140,10 @@ async fn relay_worker(
                             tick, ticks, txid
                         );
                     }
+                    println!(
+                        "[relay-{worker_id}] tick {}/{} - rebroadcasting/blasting {}",
+                        tick, ticks, txid
+                    );
                     match blast_transaction_hex(tx_hex, tor_only, relay).await {
                         Ok(peer_count) if peer_count > 0 => {
                             println!(
@@ -206,6 +217,10 @@ async fn relay_worker(
                             tick, ticks, txid
                         );
                     }
+                    println!(
+                        "[relay-{worker_id}] tick {}/{} - rebroadcasting/blasting {}",
+                        tick, ticks, txid
+                    );
                     match blast_transaction_hex(&tx_hex, tor_only, relay).await {
                         Ok(peer_count) if peer_count > 0 => {
                             println!(

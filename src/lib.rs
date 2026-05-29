@@ -715,10 +715,11 @@ async fn deliver_poop_tx(
                             false
                         }
                     }) {
-                        error!(
-                            "[NotFound] {:?} (UA: '{}') Possible LIAR detected! This node might be lying and tricking the code!! (If tx {} is already in a block, this is expected)",
+                        info!(
+                            "[CONFIRMED HIT] {:?} (UA: '{}') peer already knew tx {}; counting duplicate as receipt",
                             addr, peer_version_message.user_agent, txid
                         );
+                        tx_confirmed_by_peer = true;
                         break;
                     }
                 }

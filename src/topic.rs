@@ -12,6 +12,7 @@ use tokio::signal;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, info, warn};
 
+use crate::mempool::fetch_recent_txids;
 use crate::blast_transaction_hex;
 
 const BITCOIN_PIGEON_TOPIC: &str = "bitcoin-pigeon";
@@ -74,6 +75,62 @@ pub async fn run_topic_network(tx_hex: Option<String>, tor_only: bool) -> Result
             },
             _ = signal::ctrl_c() => {
                 info!("shutting down bitcoin-pigeon topic node");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn run_gossip_client(label: impl Into<String>, tor_only: bool) -> Result<()> {
+    let label = label.into();
+    let (mut swarm, _topic) = build_topic_swarm()?;
+    let mut seen_txs = HashSet::new();
+
+    loop {
+        tokio::select! {
+            event = swarm.select_next_some() => match event {
+                SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                    propagation_source,
+                    message_id,
+                    message,
+                })) => {
+                    let txid = decode_transaction_bytes(&message.data)
+                        .map(|tx| tx.compute_txid().to_string())
+                        .unwrap_or_else(|_| hex::encode(&message.data));
+                    info!(%label, ?propagation_source, %message_id, %txid, "gossip client observed bitcoin-pigeon message");
+                    if let Err(err) = observe_topic_tx(&label, &message.data, tor_only, &mut seen_txs).await {
+                        warn!(error = %err, "failed to observe topic tx");
+                    }
+                }
+                SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
+                    info!(%label, ?peer_id, %topic, "gossip client subscribed");
+                }
+                SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                    for (peer_id, addr) in list {
+                        info!(%label, ?peer_id, ?addr, "gossip client discovered peer");
+                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                        if let Err(err) = swarm.dial(addr.clone()) {
+                            warn!(?peer_id, ?addr, "gossip client failed to dial discovered peer: {err}");
+                        }
+                    }
+                }
+                SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                    for (peer_id, addr) in list {
+                        info!(%label, ?peer_id, ?addr, "gossip client expired peer");
+                        swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                    }
+                }
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    info!(%label, ?address, "gossip client listening for bitcoin-pigeon peers");
+                }
+                other => {
+                    info!(%label, ?other, "gossip client swarm event");
+                }
+            },
+            _ = signal::ctrl_c() => {
+                info!(%label, "shutting down bitcoin-pigeon gossip client");
                 break;
             }
         }
@@ -286,9 +343,58 @@ async fn handle_topic_tx(
         return Ok(());
     }
 
+    log_local_mempool(label).await?;
+
     let tx_hex = hex::encode(data);
+    info!(%label, %txid, "rebroadcasting received tx from bitcoin-pigeon topic");
     info!(%label, %txid, "blasting transaction from bitcoin-pigeon topic");
     blast_transaction_hex(&tx_hex, tor_only, true).await?;
+    Ok(())
+}
+
+async fn observe_topic_tx(
+    label: &str,
+    data: &[u8],
+    tor_only: bool,
+    seen_txs: &mut HashSet<bitcoin::Txid>,
+) -> Result<()> {
+    let tx = decode_transaction_bytes(data)?;
+    let txid = tx.compute_txid();
+
+    if !seen_txs.insert(txid) {
+        info!(%label, %txid, "already observed bitcoin-pigeon tx");
+        return Ok(());
+    }
+
+    log_local_mempool(label).await?;
+    info!(%label, %txid, "observed bitcoin-pigeon topic tx");
+    if tor_only {
+        info!(%label, %txid, "tor-only gossip watch active");
+    }
+
+    Ok(())
+}
+
+async fn log_local_mempool(label: &str) -> Result<()> {
+    const LOCAL_MEMPOOL_LIMIT: usize = 5;
+
+    let txids = fetch_recent_txids(LOCAL_MEMPOOL_LIMIT).await?;
+    info!(
+        %label,
+        count = txids.len(),
+        "iterating local mempool after topic receipt"
+    );
+
+    for (index, txid) in txids.iter().enumerate() {
+        info!(
+            %label,
+            index = index + 1,
+            total = txids.len(),
+            %txid,
+            "local mempool tx"
+        );
+    }
+
     Ok(())
 }
 

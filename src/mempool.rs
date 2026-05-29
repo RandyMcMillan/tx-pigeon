@@ -5,6 +5,7 @@ use std::{collections::HashSet, time::Duration};
 use tracing::{info, warn};
 
 const MEMPOOL_RECENT_URL: &str = "https://mempool.space/api/mempool/recent";
+const BITCOIN_GOB_SV_RECENT_URL: &str = "https://bitcoin.gob.sv/api/mempool/recent";
 const MEMPOOL_TX_HEX_URL: &str = "https://mempool.space/api/tx/{txid}/hex";
 const MEMPOOL_ONION_URL: &str =
     "http://mempoolhqx4isw62xs7abwphsq7ldayuidyx2v2oethdhhj6mlo2r6ad.onion/api/mempool/recent";
@@ -28,7 +29,15 @@ pub async fn fetch_recent_txids(limit: usize) -> Result<Vec<String>> {
         limit,
         "requesting recent mempool txids"
     );
+    info!(
+        source = "bitcoin.gob.sv",
+        url = BITCOIN_GOB_SV_RECENT_URL,
+        limit,
+        "requesting recent mempool txids"
+    );
     let clearnet_fut = fetch_from_source(&clearnet_client, MEMPOOL_RECENT_URL, "mempool.space");
+    let gob_sv_fut =
+        fetch_from_source(&clearnet_client, BITCOIN_GOB_SV_RECENT_URL, "bitcoin.gob.sv");
     let onion_fut = async {
         match tor_client.as_ref() {
             Some(client) => {
@@ -44,12 +53,14 @@ pub async fn fetch_recent_txids(limit: usize) -> Result<Vec<String>> {
         }
     };
 
-    let (clearnet_result, onion_result) = tokio::join!(clearnet_fut, onion_fut);
+    let (clearnet_result, gob_sv_result, onion_result) =
+        tokio::join!(clearnet_fut, gob_sv_fut, onion_fut);
 
     let mut merged = Vec::new();
     let mut seen = HashSet::new();
 
     merge_recent("mempool.space", clearnet_result, limit, &mut seen, &mut merged);
+    merge_recent("bitcoin.gob.sv", gob_sv_result, limit, &mut seen, &mut merged);
 
     if let Some(onion_result) = onion_result {
         merge_recent("mempool onion", onion_result, limit, &mut seen, &mut merged);

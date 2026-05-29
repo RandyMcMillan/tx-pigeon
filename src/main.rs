@@ -42,6 +42,13 @@ enum Command {
         #[arg(long, default_value_t = 15)]
         interval_secs: u64,
     },
+
+    /// Watch bitcoin-pigeon gossip activity without rebroadcasting it
+    Gossip {
+        /// Human-readable label for the watcher
+        #[arg(long, default_value = "gossip-client")]
+        label: String,
+    },
 }
 
 #[tokio::main]
@@ -62,6 +69,9 @@ async fn main() -> Result<()> {
             interval_secs,
         }) => {
             tx_pigeon::relay_transactions(limit, args.tor_only, true, interval_secs).await?;
+        }
+        Some(Command::Gossip { label }) => {
+            tx_pigeon::topic::run_gossip_client(label, args.tor_only).await?;
         }
         None => {
             let tx = args.tx.context("missing --tx")?;
