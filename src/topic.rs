@@ -8,7 +8,8 @@ use libp2p::{
 use sha3::{Digest, Sha3_256};
 use std::collections::HashSet;
 use tokio::signal;
-use tracing::{info, warn};
+use tokio::time::{Duration, sleep};
+use tracing::{debug, info, warn};
 
 use crate::blast_transaction_hex;
 
@@ -32,6 +33,7 @@ pub async fn run_topic_network(tx_hex: Option<String>, tor_only: bool) -> Result
         )?
         .with_behaviour(|keypair| {
             let peer_id = keypair.public().to_peer_id();
+            debug!("peer_id={}", peer_id);
             let topic_name = BITCOIN_PIGEON_TOPIC.to_owned();
 
             let mut config = gossipsub::ConfigBuilder::default();
@@ -131,13 +133,51 @@ async fn publish_topic_tx(
     let raw_bytes = hex::decode(&tx_hex).context("failed to decode transaction hex")?;
 
     info!(%txid, "publishing transaction to bitcoin-pigeon topic");
-    swarm
-        .behaviour_mut()
-        .gossipsub
-        .publish(topic.clone(), raw_bytes.clone())
-        .context("failed to publish tx on topic")?;
+    let published = publish_with_retry(swarm, topic, raw_bytes.clone(), txid).await?;
+    if !published {
+        warn!(
+            %txid,
+            "publishing tx on topic never found peers; continuing with local processing"
+        );
+    }
 
     handle_topic_tx(&raw_bytes, tor_only, seen_txs).await
+}
+
+async fn publish_with_retry(
+    swarm: &mut Swarm<TopicBehaviour>,
+    topic: &gossipsub::IdentTopic,
+    raw_bytes: Vec<u8>,
+    txid: bitcoin::Txid,
+) -> Result<bool> {
+    const MAX_ATTEMPTS: usize = 30;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic.clone(), raw_bytes.clone())
+        {
+            Ok(_) => {
+                info!(%txid, attempt, "published bitcoin-pigeon topic transaction");
+                return Ok(true);
+            }
+            Err(err) if err.to_string().contains("InsufficientPeers") => {
+                warn!(
+                    %txid,
+                    attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    "topic swarm has no peers yet; retrying publish"
+                );
+                sleep(Duration::from_secs(1)).await;
+            }
+            Err(err) => {
+                return Err(err).context("failed to publish tx on topic");
+            }
+        }
+    }
+
+    Ok(false)
 }
 
 async fn handle_topic_tx(
