@@ -2,7 +2,7 @@ use anyhow::Result;
 use reqwest::{Client, Proxy};
 use serde::Deserialize;
 use std::{collections::HashSet, time::Duration};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const MEMPOOL_RECENT_URL: &str = "https://mempool.space/api/mempool/recent";
 const BITCOIN_GOB_SV_RECENT_URL: &str = "https://bitcoin.gob.sv/api/mempool/recent";
@@ -65,7 +65,7 @@ pub async fn fetch_recent_txids(limit: usize) -> Result<Vec<String>> {
     if let Some(onion_result) = onion_result {
         merge_recent("mempool onion", onion_result, limit, &mut seen, &mut merged);
     } else {
-        warn!("mempool onion fetch skipped because no Tor SOCKS proxy was available");
+        debug!("mempool onion fetch skipped because no Tor SOCKS proxy was available");
     }
 
     info!(
@@ -93,7 +93,7 @@ pub async fn fetch_recent_tx_hexes(limit: usize) -> Result<Vec<(String, String)>
                     match fetch_tx_hex(client, &txid, MEMPOOL_ONION_TX_HEX_URL, "mempool onion").await {
                         Ok(tx_hex) => txs.push((txid, tx_hex)),
                         Err(onion_err) => {
-                            warn!(txid = %txid, error = %onion_err, "onion tx hex fetch failed");
+                            debug!(txid = %txid, error = %onion_err, "optional onion tx hex fetch failed");
                         }
                     }
                 }
@@ -167,7 +167,15 @@ fn merge_recent(
             );
         }
         Err(err) => {
-            warn!(source = label, error = %err, "failed to fetch recent mempool txids");
+            if label == "mempool onion" {
+                debug!(
+                    source = label,
+                    error = %err,
+                    "optional recent mempool txids source unavailable"
+                );
+            } else {
+                warn!(source = label, error = %err, "failed to fetch recent mempool txids");
+            }
         }
     }
 }
