@@ -408,6 +408,7 @@ async fn observe_topic_tx(
         return Ok(());
     }
 
+    log_deserialized_transaction(label, &tx);
     log_local_mempool(label).await?;
     info!(%label, %txid, "observed bitcoin-pigeon topic tx");
     if tor_only {
@@ -415,6 +416,43 @@ async fn observe_topic_tx(
     }
 
     Ok(())
+}
+
+fn log_deserialized_transaction(label: &str, tx: &Transaction) {
+    let txid = tx.compute_txid();
+    info!(
+        %label,
+        %txid,
+        version = ?tx.version,
+        input_count = tx.input.len(),
+        output_count = tx.output.len(),
+        lock_time = ?tx.lock_time,
+        "gossip client deserialized tx"
+    );
+
+    for (index, input) in tx.input.iter().enumerate() {
+        info!(
+            %label,
+            %txid,
+            input_index = index,
+            prevout = ?input.previous_output,
+            sequence = ?input.sequence,
+            script_sig_len = input.script_sig.len(),
+            witness_items = input.witness.len(),
+            "gossip client tx input"
+        );
+    }
+
+    for (index, output) in tx.output.iter().enumerate() {
+        info!(
+            %label,
+            %txid,
+            output_index = index,
+            value = ?output.value,
+            script_pubkey = %output.script_pubkey,
+            "gossip client tx output"
+        );
+    }
 }
 
 async fn log_local_mempool(label: &str) -> Result<()> {
