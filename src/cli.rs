@@ -12,6 +12,14 @@ struct Args {
     #[arg(long)]
     tor_only: bool,
 
+    /// Override the libp2p gossipsub protocol prefix, e.g. /gnostr
+    #[arg(long)]
+    protocol: Option<String>,
+
+    /// Override the libp2p gossipsub protocol version, e.g. 1.0.0 or 1.1.0
+    #[arg(long = "protocol-version")]
+    protocol_version: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -65,7 +73,7 @@ pub async fn run() -> Result<()> {
     let args = Args::parse();
     match args.command {
         Some(Command::Topic { tx }) => {
-            crate::topic::run_topic_network(tx, args.tor_only).await?;
+            crate::topic::run_topic_network(tx, args.tor_only, args.protocol, args.protocol_version).await?;
         }
         Some(Command::Fetch { limit }) => {
             let txs = crate::fetch_transactions(limit, args.tor_only, true).await?;
@@ -82,9 +90,18 @@ pub async fn run() -> Result<()> {
             local: local_flag,
             remote: remote_flag,
         }) => {
+            // Default to both views when neither flag is set so the watcher
+            // shows the full network picture out of the box.
             let local = local_flag || (!local_flag && !remote_flag);
             let remote = remote_flag || (!local_flag && !remote_flag);
-            crate::topic::run_gossip_client(label, args.tor_only, local, remote).await?;
+            crate::topic::run_gossip_client(
+                label,
+                args.tor_only,
+                local,
+                remote,
+                args.protocol,
+                args.protocol_version,
+            ).await?;
         }
         None => {
             let tx = args.tx.context("missing --tx")?;

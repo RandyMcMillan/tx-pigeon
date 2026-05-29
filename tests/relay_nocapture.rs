@@ -42,14 +42,14 @@ async fn relay_nocapture_60_seconds() {
     let mut topic_nodes = Vec::new();
     for node_id in 1..=3 {
         println!("[topic-{node_id}] booting libp2p relay node (seed_tx={})", node_id == 1);
-        let handle = spawn_topic_network(format!("topic-{node_id}"), tor_only)
+        let handle = spawn_topic_network(format!("topic-{node_id}"), tor_only, None, None)
             .await
             .expect("start topic relay network");
         topic_nodes.push(handle);
     }
 
     let gossip_client = tokio::spawn(async move {
-        let _ = run_gossip_client("gossip-client", tor_only, true, true).await;
+        let _ = run_gossip_client("gossip-client", tor_only, true, true, None, None).await;
     });
 
     // Give mDNS a moment to discover the other relay nodes before the first

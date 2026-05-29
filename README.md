@@ -14,6 +14,41 @@ The core tx blasting logic is now exposed as a Rust library:
 let delivered = tx_pigeon::blast_transaction_hex(tx_hex).await?;
 ```
 
+## CLI
+
+The binary now exposes the CLI in `src/cli.rs` and supports these modes:
+
+```bash
+# Blast a transaction hex
+cargo run -- --tx <hex>
+
+# Run the topic network
+cargo run --bin tx-pigeon -- topic
+
+# Fetch peer transactions
+cargo run --bin tx-pigeon -- fetch --limit 20
+
+# Relay peer transactions in a loop
+cargo run --bin tx-pigeon -- relay --limit 20 --interval-secs 15
+
+# Watch gossip activity with a libp2p protocol prefix
+cargo run --bin tx-pigeon -- gossip --label gossip-client --local --remote --protocol /gnostr
+
+# Or pin a protocol prefix and version explicitly
+cargo run --bin tx-pigeon -- gossip --label gossip-client --protocol /gnostr --protocol-version 1.0.0
+```
+
+Gossip mode defaults to both `--local` and `--remote` when neither flag is set:
+
+- `--local` prints local mempool polling and local transaction summaries
+- `--remote` prints gossipsub / hole-punch transaction summaries
+- `--protocol /gnostr` sets a libp2p protocol prefix
+- `--protocol-version 0.0.1` (or any suffix) appends to `--protocol` as a full libp2p protocol id
+
+The live relay runtime now mirrors the test swarm more closely: multiple relay workers run concurrently and rebroadcast independently instead of a single serialized loop.
+
+Relay workers still exit on `ctrl_c` and log `stopping p2p relay loop` before breaking out of the cycle.
+
 
 ## Setup
 

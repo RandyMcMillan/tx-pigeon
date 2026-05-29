@@ -27,8 +27,13 @@ struct TopicBehaviour {
     dcutr: dcutr::Behaviour,
 }
 
-pub async fn run_topic_network(tx_hex: Option<String>, tor_only: bool) -> Result<()> {
-    let (mut swarm, topic) = build_topic_swarm()?;
+pub async fn run_topic_network(
+    tx_hex: Option<String>,
+    tor_only: bool,
+    protocol: Option<String>,
+    protocol_version: Option<String>,
+) -> Result<()> {
+    let (mut swarm, topic) = build_topic_swarm(protocol, protocol_version)?;
     let mut seen_txs = HashSet::new();
     if let Some(tx_hex) = tx_hex {
         publish_topic_tx("topic-cli", &mut swarm, &topic, tx_hex, tor_only, &mut seen_txs).await?;
@@ -95,14 +100,18 @@ pub async fn run_topic_network(tx_hex: Option<String>, tor_only: bool) -> Result
     Ok(())
 }
 
+/// Run the gossip observer with optional local mempool polling and remote
+/// gossipsub / hole-punch event tracing.
 pub async fn run_gossip_client(
     label: impl Into<String>,
     tor_only: bool,
     show_local: bool,
     show_remote: bool,
+    protocol: Option<String>,
+    protocol_version: Option<String>,
 ) -> Result<()> {
     let label = label.into();
-    let (mut swarm, _topic) = build_topic_swarm()?;
+    let (mut swarm, _topic) = build_topic_swarm(protocol, protocol_version)?;
     let mut seen_txs = HashSet::new();
     let mut mempool_tick = interval(Duration::from_secs(10));
 
@@ -194,9 +203,14 @@ impl TopicRelayHandle {
     }
 }
 
-pub async fn spawn_topic_network(label: impl Into<String>, tor_only: bool) -> Result<TopicRelayHandle> {
+pub async fn spawn_topic_network(
+    label: impl Into<String>,
+    tor_only: bool,
+    protocol: Option<String>,
+    protocol_version: Option<String>,
+) -> Result<TopicRelayHandle> {
     let label = label.into();
-    let (mut swarm, topic) = build_topic_swarm()?;
+    let (mut swarm, topic) = build_topic_swarm(protocol, protocol_version)?;
     let (publish_tx, mut publish_rx) = mpsc::channel::<String>(64);
     let mut seen_txs = HashSet::new();
 
@@ -274,7 +288,13 @@ pub async fn spawn_topic_network(label: impl Into<String>, tor_only: bool) -> Re
     Ok(TopicRelayHandle { publish_tx })
 }
 
-fn build_topic_swarm() -> Result<(Swarm<TopicBehaviour>, gossipsub::IdentTopic)> {
+fn build_topic_swarm(
+    protocol: Option<String>,
+    protocol_version: Option<String>,
+) -> Result<(Swarm<TopicBehaviour>, gossipsub::IdentTopic)> {
+    let peer_topic_name = BITCOIN_PIGEON_TOPIC.to_owned();
+    let gossipsub_config =
+        build_gossipsub_config(protocol, protocol_version, peer_topic_name.clone())?;
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -286,19 +306,10 @@ fn build_topic_swarm() -> Result<(Swarm<TopicBehaviour>, gossipsub::IdentTopic)>
             (libp2p::tls::Config::new, libp2p::noise::Config::new),
             libp2p::yamux::Config::default,
         )?
-        .with_behaviour(|keypair, relay_client| {
+        .with_behaviour(move |keypair, relay_client| {
             let peer_id = keypair.public().to_peer_id();
             debug!("peer_id={}", peer_id);
-            let topic_name = BITCOIN_PIGEON_TOPIC.to_owned();
-
-            let mut config = gossipsub::ConfigBuilder::default();
-            config.validation_mode(gossipsub::ValidationMode::Anonymous);
-            config.message_id_fn(move |message: &gossipsub::Message| {
-                tx_message_id(message, &topic_name)
-            });
-            let config = config
-                .build()
-                .map_err(|e| anyhow::anyhow!("failed to build gossipsub config: {e}"))?;
+            let config = gossipsub_config.clone();
 
             let gossipsub = gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, config)
                 .map_err(|e| anyhow::anyhow!("failed to build gossipsub behaviour: {e}"))?;
@@ -329,6 +340,68 @@ fn build_topic_swarm() -> Result<(Swarm<TopicBehaviour>, gossipsub::IdentTopic)>
         .context("failed to start listening")?;
 
     Ok((swarm, topic))
+}
+
+fn build_gossipsub_config(
+    protocol: Option<String>,
+    protocol_version: Option<String>,
+    topic_name: String,
+) -> Result<gossipsub::Config> {
+    let mut config = gossipsub::ConfigBuilder::default();
+    config.validation_mode(gossipsub::ValidationMode::Anonymous);
+    config.message_id_fn(move |message: &gossipsub::Message| {
+        tx_message_id(message, &topic_name)
+    });
+    match (protocol, protocol_version) {
+        (Some(prefix), Some(version)) => {
+            let protocol_id = compose_protocol_id(&prefix, &version);
+            let version = gossipsub_version_for(&version);
+            config.protocol_id(protocol_id, version);
+        }
+        (Some(prefix), None) => {
+            config.protocol_id_prefix(prefix.trim_end_matches('/').to_owned());
+        }
+        (None, Some(_)) => {
+            return Err(anyhow::anyhow!("--protocol-version requires --protocol"));
+        }
+        (None, None) => {}
+    }
+    config
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to build gossipsub config: {e}"))
+}
+
+fn compose_protocol_id(prefix: &str, version: &str) -> String {
+    format!(
+        "{}/{}",
+        prefix.trim_end_matches('/'),
+        version.trim_start_matches('/')
+    )
+}
+
+fn gossipsub_version_for(version: &str) -> gossipsub::Version {
+    if version == "1.1.0" {
+        gossipsub::Version::V1_1
+    } else {
+        gossipsub::Version::V1_0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compose_protocol_id;
+
+    #[test]
+    fn composes_custom_protocol_ids() {
+        assert_eq!(
+            compose_protocol_id("custom_protocol", "0.0.1"),
+            "custom_protocol/0.0.1"
+        );
+        assert_eq!(
+            compose_protocol_id("/custom_protocol/", "/0.0.1"),
+            "/custom_protocol/0.0.1"
+        );
+    }
 }
 
 async fn publish_topic_tx(
@@ -445,6 +518,8 @@ async fn poll_recent_transactions(
     tor_only: bool,
     seen_txs: &mut HashSet<bitcoin::Txid>,
 ) -> Result<()> {
+    // Local mode polls recent mempool entries so the observer still prints txs
+    // even when no remote peer delivers a gossipsub message yet.
     const RECENT_LIMIT: usize = 5;
 
     let txs = fetch_recent_tx_hexes(RECENT_LIMIT).await?;

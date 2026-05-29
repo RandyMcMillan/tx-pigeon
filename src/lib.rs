@@ -30,7 +30,7 @@ use tokio::{
     net::lookup_host,
     sync::Semaphore,
     task::JoinSet,
-    time::{MissedTickBehavior, interval, timeout},
+    time::{MissedTickBehavior, interval, sleep, timeout},
 };
 use tracing::{debug, error, info};
 use tor_rtcompat::PreferredRuntime;
@@ -236,27 +236,84 @@ pub async fn relay_transactions(
     relay: bool,
     interval_secs: u64,
 ) -> Result<()> {
+    // Mirror the test harness: a few staggered workers fetch and rebroadcast
+    // independently instead of one serialized relay loop.
+    let mut workers = Vec::new();
+    for worker_id in 1..=3 {
+        workers.push(tokio::spawn(relay_worker(
+            worker_id,
+            limit,
+            tor_only,
+            relay,
+            interval_secs,
+        )));
+    }
+
+    for worker in workers {
+        let _ = worker.await;
+    }
+
+    Ok(())
+}
+
+async fn relay_worker(
+    worker_id: usize,
+    limit: usize,
+    tor_only: bool,
+    relay: bool,
+    interval_secs: u64,
+) {
     let mut seen_txids = HashSet::<bitcoin::Txid>::new();
     let mut ticker = interval(Duration::from_secs(interval_secs));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
+    info!(
+        worker_id,
+        interval_secs,
+        "relay worker online"
+    );
+
+    // Stagger the worker start so all relays do not fetch at the same instant.
+    sleep(Duration::from_secs((worker_id - 1) as u64)).await;
+
     loop {
         tokio::select! {
             _ = ticker.tick() => {
-                info!(interval_secs, "running p2p relay cycle");
-                let txs = fetch_transactions(limit, tor_only, relay).await?;
-                info!(count = txs.len(), "relay cycle fetched transactions");
+                info!(worker_id, interval_secs, "running p2p relay cycle");
 
-                for tx in txs {
-                    let txid = tx.compute_txid();
-                    if !seen_txids.insert(txid) {
-                        info!(%txid, "already relayed this tx");
-                        continue;
+                match fetch_transactions(limit, tor_only, relay).await {
+                    Ok(txs) => {
+                        info!(worker_id, count = txs.len(), "relay cycle fetched transactions");
+
+                        for (index, tx) in txs.into_iter().enumerate() {
+                            let txid = tx.compute_txid();
+                            if !seen_txids.insert(txid) {
+                                info!(worker_id, %txid, "already relayed this tx");
+                                continue;
+                            }
+
+                            let tx_hex = match encode_transaction_hex(&tx) {
+                                Ok(tx_hex) => tx_hex,
+                                Err(err) => {
+                                    error!(worker_id, %txid, error = %err, "failed to encode transaction for relay");
+                                    continue;
+                                }
+                            };
+
+                            info!(
+                                worker_id,
+                                tx_index = index + 1,
+                                %txid,
+                                "rebroadcasting fetched tx p2p"
+                            );
+                            if let Err(err) = blast_transaction_hex(&tx_hex, tor_only, relay).await {
+                                error!(worker_id, %txid, error = %err, "relay blast failed");
+                            }
+                        }
                     }
-
-                    let tx_hex = encode_transaction_hex(&tx)?;
-                    info!(%txid, "rebroadcasting fetched tx p2p");
-                    blast_transaction_hex(&tx_hex, tor_only, relay).await?;
+                    Err(err) => {
+                        error!(worker_id, error = %err, "relay cycle fetch failed");
+                    }
                 }
             }
             _ = signal::ctrl_c() => {
@@ -265,8 +322,6 @@ pub async fn relay_transactions(
             }
         }
     }
-
-    Ok(())
 }
 
 fn build_version_msg(relay: bool) -> VersionMessage {
