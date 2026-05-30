@@ -42,6 +42,7 @@ Gossip mode defaults to both `--local` and `--remote` when neither flag is set:
 
 - `--local` prints local mempool polling and local transaction summaries
 - `--remote` prints gossipsub / hole-punch transaction summaries
+- Default protocol is `gnostr/0.0.1` when no flags are passed
 - `--protocol /gnostr` sets a libp2p protocol prefix
 - `--protocol-version 0.0.1` (or any suffix) appends to `--protocol` as a full libp2p protocol id
 
