@@ -16,6 +16,8 @@ use crate::mempool::{fetch_recent_tx_hexes, fetch_recent_txids};
 use crate::blast_transaction_hex;
 
 const BITCOIN_PIGEON_TOPIC: &str = "bitcoin-pigeon";
+const DEFAULT_PROTOCOL_PREFIX: &str = "gnostr";
+const DEFAULT_PROTOCOL_VERSION: &str = "0.0.1";
 
 #[derive(NetworkBehaviour)]
 #[behaviour(prelude = "libp2p::swarm::derive_prelude")]
@@ -364,7 +366,12 @@ fn build_gossipsub_config(
         (None, Some(_)) => {
             return Err(anyhow::anyhow!("--protocol-version requires --protocol"));
         }
-        (None, None) => {}
+        (None, None) => {
+            config.protocol_id(
+                compose_protocol_id(DEFAULT_PROTOCOL_PREFIX, DEFAULT_PROTOCOL_VERSION),
+                gossipsub_version_for(DEFAULT_PROTOCOL_VERSION),
+            );
+        }
     }
     config
         .build()
@@ -400,6 +407,14 @@ mod tests {
         assert_eq!(
             compose_protocol_id("/custom_protocol/", "/0.0.1"),
             "/custom_protocol/0.0.1"
+        );
+    }
+
+    #[test]
+    fn default_protocol_id_is_gnostr() {
+        assert_eq!(
+            compose_protocol_id("gnostr", "0.0.1"),
+            "gnostr/0.0.1"
         );
     }
 }
