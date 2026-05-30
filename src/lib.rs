@@ -372,7 +372,7 @@ fn build_version_msg(relay: bool) -> VersionMessage {
             ServiceFlags::from(NODE_NETWORK | NODE_WITNESS | NODE_LIBRE_RELAY),
         ),
         nonce: rand::random::<u64>(),
-        user_agent: "/Satoshi:29.2.0/Knots:20251110/UASF-BIP110:0.1/".into(),
+        user_agent: "/Gnostr:0.0.1/".into(),
         start_height: 897157, //get current blockheight minus 20?
         relay,
     }
