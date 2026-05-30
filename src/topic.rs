@@ -16,7 +16,7 @@ use crate::mempool::{fetch_recent_tx_hexes, fetch_recent_txids};
 use crate::blast_transaction_hex;
 
 const BITCOIN_PIGEON_TOPIC: &str = "bitcoin-pigeon";
-const DEFAULT_PROTOCOL_PREFIX: &str = "gnostr";
+const DEFAULT_PROTOCOL_PREFIX: &str = "/gnostr";
 const DEFAULT_PROTOCOL_VERSION: &str = "0.0.1";
 
 #[derive(NetworkBehaviour)]
@@ -413,8 +413,8 @@ mod tests {
     #[test]
     fn default_protocol_id_is_gnostr() {
         assert_eq!(
-            compose_protocol_id("gnostr", "0.0.1"),
-            "gnostr/0.0.1"
+            compose_protocol_id("/gnostr", "0.0.1"),
+            "/gnostr/0.0.1"
         );
     }
 }
