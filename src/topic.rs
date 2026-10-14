@@ -525,7 +525,7 @@ fn build_gossipsub_config(
         .map_err(|e| anyhow::anyhow!("failed to build gossipsub config: {e}"))
 }
 
-fn compose_protocol_id(prefix: &str, version: &str) -> String {
+pub fn compose_protocol_id(prefix: &str, version: &str) -> String {
     format!(
         "{}/{}",
         prefix.trim_end_matches('/'),
