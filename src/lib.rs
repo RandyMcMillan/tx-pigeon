@@ -195,6 +195,7 @@ pub async fn blast_transaction(
                 tor_client,
                 prefs,
                 relay,
+                tor_only,
                 log,
             )
             .await
@@ -427,16 +428,22 @@ fn encode_transaction_hex(tx: &Transaction) -> Result<String> {
 }
 
 async fn discover_libre_peers() -> Result<HashSet<NetworkAddress>> {
+    discover_libre_peers_from_seeds(DNS_SEEDS).await
+}
+
+async fn discover_libre_peers_from_seeds(
+    seeds: &[&str],
+) -> Result<HashSet<NetworkAddress>> {
     let mut seed_addrs = Vec::new();
     let mut seed_tasks = JoinSet::new();
 
-    for seed_host in DNS_SEEDS {
+    for seed_host in seeds {
         info!("fetching addrs from {:?}", seed_host);
 
         let host = seed_host.to_owned();
 
         seed_tasks.spawn(async move {
-            let lookup = lookup_host(format!("{}:8333", seed_host));
+            let lookup = lookup_host(format!("{}:8333", host));
 
             match timeout(Duration::from_secs(2), lookup).await {
                 Ok(Ok(addrs)) => {
@@ -445,7 +452,7 @@ async fn discover_libre_peers() -> Result<HashSet<NetworkAddress>> {
                 }
                 Ok(Err(e)) => Err(anyhow::Error::new(e)),
                 Err(_) => {
-                    error!("Timeout while looking up {}", seed_host);
+                    error!("Timeout while looking up {}", host);
                     Err(anyhow::anyhow!("Timeout"))
                 }
             }
@@ -508,7 +515,20 @@ async fn discover_libre_peers() -> Result<HashSet<NetworkAddress>> {
 
 #[cfg(test)]
 mod tests {
-    use super::arti_state_dir;
+    use super::{
+        NetworkAddress, arti_state_dir, discover_libre_peers_from_seeds,
+        filter_peers_for_tor_only, skip_clearnet_in_tor_only,
+    };
+    use std::collections::HashSet;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    fn ip_addr() -> NetworkAddress {
+        NetworkAddress::Ip(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 8333))
+    }
+
+    fn onion_addr() -> NetworkAddress {
+        NetworkAddress::Onion("abcd1234abcd1234.onion".to_string())
+    }
 
     #[test]
     fn appends_run_id_to_arti_state_dir() {
@@ -537,6 +557,44 @@ mod tests {
             first.file_name().and_then(|value| value.to_str()),
             second.file_name().and_then(|value| value.to_str())
         );
+    }
+
+    #[test]
+    fn filter_keeps_all_peers_when_tor_is_disabled() {
+        let peers = HashSet::from([ip_addr(), onion_addr()]);
+        let filtered = filter_peers_for_tor_only(peers.clone(), false);
+        assert_eq!(filtered, peers);
+    }
+
+    #[test]
+    fn filter_keeps_only_onion_peers_when_tor_is_enabled() {
+        let peers = HashSet::from([ip_addr(), onion_addr()]);
+        let filtered = filter_peers_for_tor_only(peers, true);
+        assert_eq!(filtered, HashSet::from([onion_addr()]));
+    }
+
+    #[test]
+    fn skip_clearnet_is_false_for_ip_when_tor_is_disabled() {
+        assert!(!skip_clearnet_in_tor_only(&ip_addr(), false));
+    }
+
+    #[test]
+    fn skip_clearnet_is_true_for_ip_when_tor_is_enabled() {
+        assert!(skip_clearnet_in_tor_only(&ip_addr(), true));
+    }
+
+    #[test]
+    fn skip_clearnet_is_false_for_onion_regardless_of_tor() {
+        assert!(!skip_clearnet_in_tor_only(&onion_addr(), false));
+        assert!(!skip_clearnet_in_tor_only(&onion_addr(), true));
+    }
+
+    #[tokio::test]
+    async fn discover_libre_peers_with_no_seeds_returns_empty() {
+        let peers = discover_libre_peers_from_seeds(&[])
+            .await
+            .expect("empty seed list should succeed");
+        assert!(peers.is_empty());
     }
 }
 
