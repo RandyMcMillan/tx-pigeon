@@ -144,7 +144,7 @@ async fn relay_worker(
                         "[relay-{worker_id}] tick {}/{} - rebroadcasting/blasting {}",
                         tick, ticks, txid
                     );
-                    match blast_transaction_hex(tx_hex, tor_only, relay).await {
+                    match blast_transaction_hex(tx_hex, tor_only, relay, None).await {
                         Ok(peer_count) if peer_count > 0 => {
                             println!(
                                 "[relay-{worker_id}] tick {}/{} - peer acknowledged receipt for {} via {} peers",
@@ -221,7 +221,7 @@ async fn relay_worker(
                         "[relay-{worker_id}] tick {}/{} - rebroadcasting/blasting {}",
                         tick, ticks, txid
                     );
-                    match blast_transaction_hex(&tx_hex, tor_only, relay).await {
+                    match blast_transaction_hex(&tx_hex, tor_only, relay, None).await {
                         Ok(peer_count) if peer_count > 0 => {
                             println!(
                                 "[relay-{worker_id}] tick {}/{} - peer acknowledged receipt for {} via {} peers",
