@@ -37,15 +37,22 @@ use tokio::{
 };
 use tracing::{debug, error, info};
 use tor_rtcompat::PreferredRuntime;
-
 pub mod topic;
 pub mod mempool;
 pub mod cli;
 
 static TOR_ONLY: AtomicBool = AtomicBool::new(false);
 
+type LogSink = Arc<dyn Fn(String) + Send + Sync>;
+
 pub fn set_tor_only(enabled: bool) {
     TOR_ONLY.store(enabled, Ordering::SeqCst);
+}
+
+fn emit_log(log: &Option<LogSink>, message: impl Into<String>) {
+    if let Some(log) = log {
+        log(message.into());
+    }
 }
 
 fn tor_only_enabled() -> bool {
@@ -105,29 +112,54 @@ enum NetworkAddress {
     Onion(String),
 }
 
-pub async fn blast_transaction_hex(tx_hex: &str, tor_only: bool, relay: bool) -> Result<usize> {
+pub async fn blast_transaction_hex(
+    tx_hex: &str,
+    tor_only: bool,
+    relay: bool,
+    log: Option<LogSink>,
+) -> Result<usize> {
     set_tor_only(tor_only);
+    emit_log(&log, "TxPigeon: parsing transaction hex for broadcast");
     let tx = bitcoin::consensus::deserialize::<Transaction>(&hex::decode(tx_hex)?)?;
-    blast_transaction(tx, tor_only, relay).await
+    blast_transaction(tx, tor_only, relay, log).await
 }
 
-pub async fn blast_transaction(tx: Transaction, _tor_only: bool, relay: bool) -> Result<usize> {
+pub async fn blast_transaction(
+    tx: Transaction,
+    _tor_only: bool,
+    relay: bool,
+    log: Option<LogSink>,
+) -> Result<usize> {
     let txid = tx.compute_txid();
 
+    emit_log(&log, format!("TxPigeon: discovering libre peers for {txid}"));
     let libre_peers = discover_libre_peers().await?;
 
     info!("time to blast some nodes with pigeon poop! 🐦💩");
     info!("blasting tx {:?} to libre relay nodes...", txid);
+    emit_log(
+        &log,
+        format!(
+            "TxPigeon: discovered {} libre peers for {txid}",
+            libre_peers.len()
+        ),
+    );
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES));
 
     let libre_peers = filter_peers_for_tor_only(libre_peers);
+    emit_log(
+        &log,
+        format!("TxPigeon: {} peers remain after Tor filtering", libre_peers.len()),
+    );
 
     info!("using {} peers after tor-only filtering", libre_peers.len());
 
     info!("Bootstrapping Tor client...");
+    emit_log(&log, "TxPigeon: bootstrapping Tor client".to_string());
     let config = tor_client_config_for_run(now_utc_integer())?;
     let tor_client = Arc::new(TorClient::create_bootstrapped(config).await?);
+    emit_log(&log, "TxPigeon: Tor client bootstrapped".to_string());
 
     let common_token = IsolationToken::no_isolation();
     let mut prefs = StreamPrefs::new();
@@ -137,6 +169,10 @@ pub async fn blast_transaction(tx: Transaction, _tor_only: bool, relay: bool) ->
     for peer_addr in libre_peers.clone() {
         if tor_only_enabled() && matches!(peer_addr, NetworkAddress::Ip(_)) {
             debug!("[TX {txid}] tor-only enabled; skipping clearnet peer {:?}", peer_addr);
+            emit_log(
+                &log,
+                format!("TxPigeon: skipping clearnet peer {:?} for {txid}", peer_addr),
+            );
             continue;
         }
 
@@ -145,7 +181,12 @@ pub async fn blast_transaction(tx: Transaction, _tor_only: bool, relay: bool) ->
         let tor_client = tor_client.clone();
         let peer_addr_cloned = peer_addr.clone();
         let prefs = prefs.clone();
+        let log = log.clone();
         debug!("\n[TX {txid}]\nscheduling delivery to {:?}", peer_addr_cloned);
+        emit_log(
+            &log,
+            format!("TxPigeon: scheduling delivery to {:?} for {txid}", peer_addr_cloned),
+        );
         poop_delivery_tasks.spawn(async move {
             let _permit_guard = permit;
             match deliver_poop_tx(
@@ -154,6 +195,7 @@ pub async fn blast_transaction(tx: Transaction, _tor_only: bool, relay: bool) ->
                 tor_client,
                 prefs,
                 relay,
+                log,
             )
             .await
             {
@@ -227,7 +269,7 @@ pub async fn fetch_transactions(limit: usize, tor_only: bool, relay: bool) -> Re
         let prefs = prefs.clone();
         peer_tasks.spawn(async move {
             let _permit_guard = permit;
-            fetch_peer_transactions(peer_addr, tor_client, prefs, relay, limit).await
+            fetch_peer_transactions(peer_addr, tor_client, prefs, relay, limit, None).await
         });
     }
 
@@ -337,7 +379,7 @@ async fn relay_worker(
                                 %txid,
                                 "rebroadcasting fetched tx p2p"
                             );
-                            if let Err(err) = blast_transaction_hex(&tx_hex, tor_only, relay).await {
+                            if let Err(err) = blast_transaction_hex(&tx_hex, tor_only, relay, None).await {
                                 error!(worker_id, %txid, error = %err, "relay blast failed");
                             }
                         }
@@ -516,13 +558,16 @@ async fn fetch_peer_transactions(
     prefs: StreamPrefs,
     relay: bool,
     limit: usize,
+    log: Option<LogSink>,
 ) -> Result<Vec<Transaction>> {
     if tor_only_enabled() && matches!(addr, NetworkAddress::Ip(_)) {
         debug!("[FETCH] tor-only enabled; skipping {:?}", addr);
+        emit_log(&log, format!("TxPigeon: skipping clearnet fetch peer {:?}", addr));
         return Ok(Vec::new());
     }
 
     debug!("[FETCH] connecting to {:?}", addr);
+    emit_log(&log, format!("TxPigeon: connecting to fetch peer {:?}", addr));
     let mut stream = match &addr {
         NetworkAddress::Ip(sa) => {
             let target = (sa.ip().to_string(), sa.port());
@@ -542,12 +587,21 @@ async fn fetch_peer_transactions(
         .map_err(|_| anyhow::anyhow!("timeout connecting to {}", host))??,
     };
     debug!("[FETCH] connected to {:?}", addr);
+    emit_log(&log, format!("TxPigeon: connected to fetch peer {:?}", addr));
 
     debug!("[FETCH] sending version to {:?}", addr);
     send_msg(&mut stream, NetworkMessage::Version(build_version_msg(relay))).await?;
+    emit_log(&log, format!("TxPigeon: sent version to fetch peer {:?}", addr));
 
     let (mut rd, mut wr) = stream.split();
     let peer_version_message = wait_for_version(&mut rd, &addr).await?;
+    emit_log(
+        &log,
+        format!(
+            "TxPigeon: fetch peer {:?} replied with version ({})",
+            addr, peer_version_message.user_agent
+        ),
+    );
     info!(
         "[FETCH] {:?} received version from peer (UA: '{}')",
         addr, peer_version_message.user_agent
@@ -556,9 +610,11 @@ async fn fetch_peer_transactions(
     debug!("[FETCH] sending verack to {:?}", addr);
     send_msg(&mut wr, NetworkMessage::Verack).await?;
     debug!("[FETCH] {:?} sent verack", addr);
+    emit_log(&log, format!("TxPigeon: completed version/verack handshake with {:?}", addr));
 
     debug!("[FETCH] requesting mempool from {:?}", addr);
     send_msg(&mut wr, NetworkMessage::MemPool).await?;
+    emit_log(&log, format!("TxPigeon: requested mempool from {:?}", addr));
     info!("[FETCH] {:?} requested mempool", addr);
 
     let mut announced = HashSet::<bitcoin::Txid>::new();
@@ -580,6 +636,13 @@ async fn fetch_peer_transactions(
                                     "[FETCH] {:?} queued tx {} for getdata",
                                     addr,
                                     hash
+                                );
+                                emit_log(
+                                    &log,
+                                    format!(
+                                        "TxPigeon: fetch peer {:?} announced tx {}",
+                                        addr, hash
+                                    ),
                                 );
                                 request_list.push(*hash);
                                 if request_list.len() >= limit {
@@ -625,6 +688,14 @@ async fn fetch_peer_transactions(
         peer_version_message.user_agent,
         request_list
     );
+    emit_log(
+        &log,
+        format!(
+            "TxPigeon: sending getdata to {:?} for {} txids",
+            addr,
+            request_list.len()
+        ),
+    );
     send_msg(
         &mut wr,
         NetworkMessage::GetData(
@@ -652,6 +723,10 @@ async fn fetch_peer_transactions(
                             received_txid,
                             fetched.len() + 1,
                             limit
+                        );
+                        emit_log(
+                            &log,
+                            format!("TxPigeon: fetch peer {:?} sent tx {}", addr, received_txid),
                         );
                         fetched.push(received_tx.clone());
                     }
@@ -720,15 +795,18 @@ async fn deliver_poop_tx(
     tor_client: Arc<TorClient<PreferredRuntime>>,
     prefs: StreamPrefs,
     relay: bool,
+    log: Option<LogSink>,
 ) -> Result<bool> {
     let txid = tx.compute_txid();
 
     if tor_only_enabled() && matches!(addr, NetworkAddress::Ip(_)) {
         debug!("[TX {txid}] tor-only enabled; skipping {:?}", addr);
+        emit_log(&log, format!("TxPigeon: skipping clearnet relay peer {:?} for {txid}", addr));
         return Ok(false);
     }
 
     debug!("[TX {txid}]\nconnecting to {:?}", addr);
+    emit_log(&log, format!("TxPigeon: connecting to relay peer {:?} for {txid}", addr));
     let mut stream = match &addr {
         NetworkAddress::Ip(sa) => {
             let target = (sa.ip().to_string(), sa.port());
@@ -749,11 +827,13 @@ async fn deliver_poop_tx(
         .map_err(|_| anyhow::anyhow!("timeout connecting to {}", host))??,
     };
     debug!("[TX {txid}]\nconnected to {:?}", addr);
+    emit_log(&log, format!("TxPigeon: connected to relay peer {:?} for {txid}", addr));
 
     debug!("[TX {txid}]\nsending version to {:?}", addr);
     if let Err(e) = send_msg(&mut stream, NetworkMessage::Version(build_version_msg(relay))).await {
         return Err(e);
     }
+    emit_log(&log, format!("TxPigeon: sent version to relay peer {:?} for {txid}", addr));
 
     let (mut rd, mut wr) = stream.split();
 
@@ -791,8 +871,19 @@ async fn deliver_poop_tx(
             "[TX {txid}] {:?}\ndoes not advertise NODE_LIBRE_RELAY,\nskipping",
             addr
         );
+        emit_log(
+            &log,
+            format!("TxPigeon: relay peer {:?} did not advertise libre-relay; skipping {txid}", addr),
+        );
         return Ok(false);
     }
+    emit_log(
+        &log,
+        format!(
+            "TxPigeon: relay peer {:?} replied with version ({})",
+            addr, peer_version_message.user_agent
+        ),
+    );
 
     debug!("[TX {txid}]\nsending verack to {:?}", addr);
     if let Err(e) = send_msg(&mut wr, NetworkMessage::Verack).await {
@@ -803,6 +894,7 @@ async fn deliver_poop_tx(
     if let Err(e) = send_msg(&mut wr, NetworkMessage::Tx(tx.clone())).await {
         return Err(e);
     }
+    emit_log(&log, format!("TxPigeon: sent tx {} to relay peer {:?}", txid, addr));
 
     debug!("[TX {txid}]\nsending getdata to {:?}", addr);
     if let Err(e) = send_msg(
@@ -813,6 +905,7 @@ async fn deliver_poop_tx(
     {
         return Err(e);
     }
+    emit_log(&log, format!("TxPigeon: requested tx echo from relay peer {:?}", addr));
 
     let mut tx_confirmed_by_peer = false;
     loop {
@@ -823,6 +916,10 @@ async fn deliver_poop_tx(
                         info!(
                             "[CONFIRMED HIT] {:?} (UA: '{}') direct hit confirmed on libre node! poop deliverd",
                             addr, peer_version_message.user_agent
+                        );
+                        emit_log(
+                            &log,
+                            format!("TxPigeon: relay peer {:?} confirmed receipt of {}", addr, txid),
                         );
                         tx_confirmed_by_peer = true;
                         break;
@@ -840,6 +937,10 @@ async fn deliver_poop_tx(
                             "[CONFIRMED HIT] {:?} (UA: '{}') peer already knew tx {}; counting duplicate as receipt",
                             addr, peer_version_message.user_agent, txid
                         );
+                        emit_log(
+                            &log,
+                            format!("TxPigeon: relay peer {:?} already knew {}", addr, txid),
+                        );
                         tx_confirmed_by_peer = true;
                         break;
                     }
@@ -855,6 +956,10 @@ async fn deliver_poop_tx(
                         info!(
                             "[CONFIRMED HIT] INV returned TX:\ndirect hit confirmed on libre node!\npoop deliverd to\n{:?}! (UA: '{}')",
                             addr, peer_version_message.user_agent
+                        );
+                        emit_log(
+                            &log,
+                            format!("TxPigeon: relay peer {:?} returned inv for {}", addr, txid),
                         );
                         tx_confirmed_by_peer = true;
                         break;
