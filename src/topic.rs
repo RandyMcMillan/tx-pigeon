@@ -500,7 +500,7 @@ async fn handle_topic_tx(
     let tx_hex = hex::encode(data);
     info!(%label, %txid, "rebroadcasting received tx from bitcoin-pigeon topic");
     info!(%label, %txid, "blasting transaction from bitcoin-pigeon topic");
-    blast_transaction_hex(&tx_hex, tor_only, true).await?;
+    blast_transaction_hex(&tx_hex, tor_only, true, None).await?;
     Ok(())
 }
 
