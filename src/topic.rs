@@ -495,7 +495,7 @@ async fn handle_topic_tx(
         return Ok(());
     }
 
-    log_local_mempool(label).await?;
+    log_local_mempool(label, tor_only).await?;
 
     let tx_hex = hex::encode(data);
     info!(%label, %txid, "rebroadcasting received tx from bitcoin-pigeon topic");
@@ -519,7 +519,7 @@ async fn observe_topic_tx(
         return Ok(());
     }
 
-    log_local_mempool(label).await?;
+    log_local_mempool(label, tor_only).await?;
     info!(%label, %txid, "observed bitcoin-pigeon topic tx");
     if tor_only {
         info!(%label, %txid, "tor-only gossip watch active");
@@ -563,7 +563,7 @@ async fn poll_recent_transactions(
             continue;
         }
 
-        log_local_mempool(label).await?;
+        log_local_mempool(label, tor_only).await?;
         info!(%label, %decoded_txid, "observed recent mempool tx");
         if tor_only {
             info!(%label, %decoded_txid, "tor-only gossip watch active");
@@ -633,7 +633,7 @@ fn log_deserialized_transaction(label: &str, tx: &Transaction) {
     }
 }
 
-async fn log_local_mempool(label: &str) -> Result<()> {
+async fn log_local_mempool(label: &str, tor_only: bool) -> Result<()> {
     const LOCAL_MEMPOOL_LIMIT: usize = 5;
 
     let txids = fetch_recent_txids(LOCAL_MEMPOOL_LIMIT, tor_only).await?;
