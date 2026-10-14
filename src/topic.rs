@@ -537,7 +537,7 @@ async fn poll_recent_transactions(
     // even when no remote peer delivers a gossipsub message yet.
     const RECENT_LIMIT: usize = 5;
 
-    let txs = fetch_recent_tx_hexes(RECENT_LIMIT).await?;
+    let txs = fetch_recent_tx_hexes(RECENT_LIMIT, tor_only).await?;
     info!(
         %label,
         count = txs.len(),
@@ -636,7 +636,7 @@ fn log_deserialized_transaction(label: &str, tx: &Transaction) {
 async fn log_local_mempool(label: &str) -> Result<()> {
     const LOCAL_MEMPOOL_LIMIT: usize = 5;
 
-    let txids = fetch_recent_txids(LOCAL_MEMPOOL_LIMIT).await?;
+    let txids = fetch_recent_txids(LOCAL_MEMPOOL_LIMIT, tor_only).await?;
     info!(
         %label,
         count = txids.len(),
