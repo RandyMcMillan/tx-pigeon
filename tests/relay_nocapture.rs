@@ -107,7 +107,7 @@ async fn relay_worker(
         ticker.tick().await;
         println!("[relay-{worker_id}] tick {}/{} - requesting mempool txs", tick, ticks);
 
-        let mempool_result = fetch_recent_tx_hexes(limit).await;
+        let mempool_result = fetch_recent_tx_hexes(limit, tor_only).await;
         match mempool_result {
             Ok(txs) => {
                 println!(
