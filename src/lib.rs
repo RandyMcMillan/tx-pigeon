@@ -531,8 +531,10 @@ mod tests {
 
     #[test]
     fn appends_run_id_to_arti_state_dir() {
+        println!("[test] appends_run_id_to_arti_state_dir: start");
         let run_id = 1_717_000_000;
         let state_dir = arti_state_dir(run_id).expect("state dir");
+        println!("[test] appends_run_id_to_arti_state_dir: state_dir={:?}", state_dir);
         assert_eq!(
             state_dir.file_name().and_then(|value| value.to_str()),
             Some("1717000000")
@@ -544,56 +546,83 @@ mod tests {
                 .and_then(|value| value.to_str()),
             Some("arti")
         );
+        println!("[test] appends_run_id_to_arti_state_dir: ok");
     }
 
     #[test]
     fn different_run_ids_produce_different_state_dirs() {
+        println!("[test] different_run_ids_produce_different_state_dirs: start");
         let first = arti_state_dir(1_717_000_000).expect("first state dir");
         let second = arti_state_dir(1_717_000_001).expect("second state dir");
+        println!("[test] different_run_ids_produce_different_state_dirs: first={:?} second={:?}", first, second);
 
         assert_ne!(first, second);
         assert_ne!(
             first.file_name().and_then(|value| value.to_str()),
             second.file_name().and_then(|value| value.to_str())
         );
+        println!("[test] different_run_ids_produce_different_state_dirs: ok");
     }
 
     #[test]
     fn filter_keeps_all_peers_when_tor_is_disabled() {
+        println!("[test] filter_keeps_all_peers_when_tor_is_disabled: start");
         let peers = HashSet::from([ip_addr(), onion_addr()]);
+        println!("[test] filter_keeps_all_peers_when_tor_is_disabled: input peers={:?}", peers);
         let filtered = filter_peers_for_tor_only(peers.clone(), false);
+        println!("[test] filter_keeps_all_peers_when_tor_is_disabled: filtered={:?}", filtered);
         assert_eq!(filtered, peers);
+        println!("[test] filter_keeps_all_peers_when_tor_is_disabled: ok");
     }
 
     #[test]
     fn filter_keeps_only_onion_peers_when_tor_is_enabled() {
+        println!("[test] filter_keeps_only_onion_peers_when_tor_is_enabled: start");
         let peers = HashSet::from([ip_addr(), onion_addr()]);
+        println!("[test] filter_keeps_only_onion_peers_when_tor_is_enabled: input peers={:?}", peers);
         let filtered = filter_peers_for_tor_only(peers, true);
+        println!("[test] filter_keeps_only_onion_peers_when_tor_is_enabled: filtered={:?}", filtered);
         assert_eq!(filtered, HashSet::from([onion_addr()]));
+        println!("[test] filter_keeps_only_onion_peers_when_tor_is_enabled: ok");
     }
 
     #[test]
     fn skip_clearnet_is_false_for_ip_when_tor_is_disabled() {
-        assert!(!skip_clearnet_in_tor_only(&ip_addr(), false));
+        println!("[test] skip_clearnet_is_false_for_ip_when_tor_is_disabled: start");
+        let addr = ip_addr();
+        println!("[test] skip_clearnet_is_false_for_ip_when_tor_is_disabled: addr={:?} tor_only=false", addr);
+        assert!(!skip_clearnet_in_tor_only(&addr, false));
+        println!("[test] skip_clearnet_is_false_for_ip_when_tor_is_disabled: ok");
     }
 
     #[test]
     fn skip_clearnet_is_true_for_ip_when_tor_is_enabled() {
-        assert!(skip_clearnet_in_tor_only(&ip_addr(), true));
+        println!("[test] skip_clearnet_is_true_for_ip_when_tor_is_enabled: start");
+        let addr = ip_addr();
+        println!("[test] skip_clearnet_is_true_for_ip_when_tor_is_enabled: addr={:?} tor_only=true", addr);
+        assert!(skip_clearnet_in_tor_only(&addr, true));
+        println!("[test] skip_clearnet_is_true_for_ip_when_tor_is_enabled: ok");
     }
 
     #[test]
     fn skip_clearnet_is_false_for_onion_regardless_of_tor() {
-        assert!(!skip_clearnet_in_tor_only(&onion_addr(), false));
-        assert!(!skip_clearnet_in_tor_only(&onion_addr(), true));
+        println!("[test] skip_clearnet_is_false_for_onion_regardless_of_tor: start");
+        let addr = onion_addr();
+        println!("[test] skip_clearnet_is_false_for_onion_regardless_of_tor: addr={:?}", addr);
+        assert!(!skip_clearnet_in_tor_only(&addr, false));
+        assert!(!skip_clearnet_in_tor_only(&addr, true));
+        println!("[test] skip_clearnet_is_false_for_onion_regardless_of_tor: ok");
     }
 
     #[tokio::test]
     async fn discover_libre_peers_with_no_seeds_returns_empty() {
+        println!("[test] discover_libre_peers_with_no_seeds_returns_empty: start");
         let peers = discover_libre_peers_from_seeds(&[])
             .await
             .expect("empty seed list should succeed");
+        println!("[test] discover_libre_peers_with_no_seeds_returns_empty: peers={:?}", peers);
         assert!(peers.is_empty());
+        println!("[test] discover_libre_peers_with_no_seeds_returns_empty: ok");
     }
 }
 
