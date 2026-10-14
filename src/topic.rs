@@ -2,12 +2,13 @@ use anyhow::{Context, Result};
 use bitcoin::{Transaction, consensus::Decodable, io::Cursor};
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, Swarm, SwarmBuilder, autonat, dcutr, gossipsub, identify, mdns, relay,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    Multiaddr, PeerId, Swarm, SwarmBuilder, autonat, dcutr, gossipsub, identify, mdns, relay,
+    swarm::{NetworkBehaviour, SwarmEvent, behaviour::toggle::Toggle},
 };
 use sha3::{Digest, Sha3_256};
 use std::collections::HashSet;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{mpsc, Mutex};
 use tokio::signal;
 use tokio::time::{Duration, sleep, interval};
 use tracing::{debug, info, warn};
@@ -37,7 +38,9 @@ pub enum TopicEvent {
 pub struct TopicConfig {
     pub bootstrap_peers: Vec<Multiaddr>,
     pub listen_addr: Multiaddr,
+    pub mdns: bool,
     pub relay_server: bool,
+    pub flood_publish: bool,
     pub protocol: Option<String>,
     pub protocol_version: Option<String>,
 }
@@ -47,7 +50,9 @@ impl Default for TopicConfig {
         Self {
             bootstrap_peers: Vec::new(),
             listen_addr: TOPIC_LISTEN_ADDR.parse().expect("valid multiaddr"),
+            mdns: true,
             relay_server: true,
+            flood_publish: false,
             protocol: None,
             protocol_version: None,
         }
@@ -58,7 +63,7 @@ impl Default for TopicConfig {
 #[behaviour(prelude = "libp2p::swarm::derive_prelude")]
 pub(crate) struct TopicBehaviour {
     gossipsub: gossipsub::Behaviour,
-    mdns: mdns::tokio::Behaviour,
+    mdns: Toggle<mdns::tokio::Behaviour>,
     relay_client: relay::client::Behaviour,
     relay_server: relay::Behaviour,
     identify: identify::Behaviour,
@@ -78,11 +83,18 @@ pub async fn run_topic_network(
         ..TopicConfig::default()
     };
     let (mut swarm, topic) = build_topic_swarm(config)?;
-    let mut seen_txs = HashSet::new();
+    let seen_txs = Arc::new(Mutex::new(HashSet::new()));
     let (event_tx, _) = mpsc::channel::<TopicEvent>(256);
 
     if let Some(tx_hex) = tx_hex {
-        publish_topic_tx("topic-cli", &mut swarm, &topic, tx_hex, tor_only, &mut seen_txs).await?;
+        let (txid, raw_bytes) = publish_topic_tx("topic-cli", &mut swarm, &topic, tx_hex).await?;
+        let seen = seen_txs.clone();
+        tokio::spawn(async move {
+            let mut guard = seen.lock().await;
+            if let Err(err) = handle_topic_tx("topic-cli", &raw_bytes, tor_only, &mut guard).await {
+                warn!(%txid, error = %err, "failed to process local topic tx");
+            }
+        });
     }
 
     loop {
@@ -93,7 +105,7 @@ pub async fn run_topic_network(
                     &mut swarm,
                     event,
                     tor_only,
-                    &mut seen_txs,
+                    seen_txs.clone(),
                     &event_tx,
                     false,
                     true,
@@ -111,25 +123,22 @@ pub async fn run_topic_network(
     Ok(())
 }
 
-/// Run the gossip observer with optional local mempool polling and remote
-/// gossipsub / hole-punch event tracing.
-pub async fn run_gossip_client(
+/// Spawn a gossip observer and return the event stream.
+///
+/// The observer subscribes to the bitcoin-pigeon topic and emits the same
+/// `TopicEvent`s as [`spawn_topic_network`], but it does not rebroadcast
+/// received transactions to the Bitcoin P2P network.
+pub async fn spawn_gossip_client(
     label: impl Into<String>,
     tor_only: bool,
     show_local: bool,
     show_remote: bool,
-    protocol: Option<String>,
-    protocol_version: Option<String>,
-) -> Result<()> {
+    config: TopicConfig,
+) -> Result<mpsc::Receiver<TopicEvent>> {
     let label = label.into();
-    let config = TopicConfig {
-        protocol,
-        protocol_version,
-        ..TopicConfig::default()
-    };
     let (mut swarm, _topic) = build_topic_swarm(config)?;
-    let mut seen_txs = HashSet::new();
-    let (event_tx, _) = mpsc::channel::<TopicEvent>(256);
+    let seen_txs = Arc::new(Mutex::new(HashSet::new()));
+    let (event_tx, event_rx) = mpsc::channel::<TopicEvent>(256);
     let mut mempool_tick = interval(Duration::from_secs(10));
 
     info!(
@@ -138,62 +147,6 @@ pub async fn run_gossip_client(
         show_remote,
         "gossip client mode selection"
     );
-
-    loop {
-        tokio::select! {
-            event = swarm.select_next_some() => {
-                if let Err(err) = handle_swarm_event(
-                    &label,
-                    &mut swarm,
-                    event,
-                    tor_only,
-                    &mut seen_txs,
-                    &event_tx,
-                    true,
-                    show_remote,
-                ).await {
-                    warn!(%label, error = %err, "failed to handle swarm event");
-                }
-            },
-            _ = mempool_tick.tick(), if show_local => {
-                if let Err(err) = poll_recent_transactions(&label, tor_only, &mut seen_txs).await {
-                    warn!(%label, error = %err, "gossip client failed to poll recent transactions");
-                }
-            },
-            _ = signal::ctrl_c() => {
-                info!(%label, "shutting down bitcoin-pigeon gossip client");
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-#[derive(Clone)]
-pub struct TopicRelayHandle {
-    publish_tx: mpsc::Sender<String>,
-}
-
-impl TopicRelayHandle {
-    pub async fn publish(&self, tx_hex: String) -> Result<()> {
-        self.publish_tx
-            .send(tx_hex)
-            .await
-            .context("failed to queue topic publish")
-    }
-}
-
-pub async fn spawn_topic_network(
-    label: impl Into<String>,
-    tor_only: bool,
-    config: TopicConfig,
-) -> Result<(TopicRelayHandle, mpsc::Receiver<TopicEvent>)> {
-    let label = label.into();
-    let (mut swarm, topic) = build_topic_swarm(config)?;
-    let (publish_tx, mut publish_rx) = mpsc::channel::<String>(64);
-    let (event_tx, event_rx) = mpsc::channel::<TopicEvent>(256);
-    let mut seen_txs = HashSet::new();
 
     tokio::spawn(async move {
         loop {
@@ -204,7 +157,104 @@ pub async fn spawn_topic_network(
                         &mut swarm,
                         event,
                         tor_only,
-                        &mut seen_txs,
+                        seen_txs.clone(),
+                        &event_tx,
+                        true,
+                        show_remote,
+                    ).await {
+                        warn!(%label, error = %err, "failed to handle swarm event");
+                    }
+                },
+                _ = mempool_tick.tick(), if show_local => {
+                    let label2 = label.clone();
+                    let seen = seen_txs.clone();
+                    tokio::spawn(async move {
+                        let mut guard = seen.lock().await;
+                        if let Err(err) = poll_recent_transactions(&label2, tor_only, &mut guard).await {
+                            warn!(%label2, error = %err, "gossip client failed to poll recent transactions");
+                        }
+                    });
+                },
+                _ = signal::ctrl_c() => {
+                    info!(%label, "shutting down bitcoin-pigeon gossip client");
+                    break;
+                }
+            }
+        }
+    });
+
+    Ok(event_rx)
+}
+
+/// Run the gossip observer until SIGINT.
+pub async fn run_gossip_client(
+    label: impl Into<String>,
+    tor_only: bool,
+    show_local: bool,
+    show_remote: bool,
+    protocol: Option<String>,
+    protocol_version: Option<String>,
+) -> Result<()> {
+    let config = TopicConfig {
+        protocol,
+        protocol_version,
+        ..TopicConfig::default()
+    };
+    let mut event_rx = spawn_gossip_client(
+        label, tor_only, show_local, show_remote, config,
+    ).await?;
+
+    loop {
+        tokio::select! {
+            _ = event_rx.recv() => {}
+            _ = signal::ctrl_c() => break,
+        }
+    }
+
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct TopicRelayHandle {
+    publish_tx: mpsc::Sender<String>,
+    local_peer_id: PeerId,
+}
+
+impl TopicRelayHandle {
+    pub async fn publish(&self, tx_hex: String) -> Result<()> {
+        self.publish_tx
+            .send(tx_hex)
+            .await
+            .context("failed to queue topic publish")
+    }
+
+    pub fn local_peer_id(&self) -> PeerId {
+        self.local_peer_id
+    }
+}
+
+pub async fn spawn_topic_network(
+    label: impl Into<String>,
+    tor_only: bool,
+    config: TopicConfig,
+) -> Result<(TopicRelayHandle, mpsc::Receiver<TopicEvent>)> {
+    let label = label.into();
+    let (mut swarm, topic) = build_topic_swarm(config)?;
+    let local_peer_id = *swarm.local_peer_id();
+    let (publish_tx, mut publish_rx) = mpsc::channel::<String>(64);
+    let (event_tx, event_rx) = mpsc::channel::<TopicEvent>(256);
+    let seen_txs = Arc::new(Mutex::new(HashSet::new()));
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                event = swarm.select_next_some() => {
+                    if let Err(err) = handle_swarm_event(
+                        &label,
+                        &mut swarm,
+                        event,
+                        tor_only,
+                        seen_txs.clone(),
                         &event_tx,
                         false,
                         true,
@@ -215,8 +265,20 @@ pub async fn spawn_topic_network(
                 maybe_tx_hex = publish_rx.recv() => {
                     match maybe_tx_hex {
                         Some(tx_hex) => {
-                            if let Err(err) = publish_topic_tx(&label, &mut swarm, &topic, tx_hex, tor_only, &mut seen_txs).await {
-                                warn!(error = %err, "failed to publish queued topic tx");
+                            match publish_topic_tx(&label, &mut swarm, &topic, tx_hex.clone()).await {
+                                Ok((txid, raw_bytes)) => {
+                                    let seen = seen_txs.clone();
+                                    let label2 = label.clone();
+                                    tokio::spawn(async move {
+                                        let mut guard = seen.lock().await;
+                                        if let Err(err) = handle_topic_tx(&label2, &raw_bytes, tor_only, &mut guard).await {
+                                            warn!(%label2, %txid, error = %err, "failed to process published topic tx");
+                                        }
+                                    });
+                                }
+                                Err(err) => {
+                                    warn!(error = %err, "failed to publish queued topic tx");
+                                }
                             }
                         }
                         None => break,
@@ -226,7 +288,7 @@ pub async fn spawn_topic_network(
         }
     });
 
-    Ok((TopicRelayHandle { publish_tx }, event_rx))
+    Ok((TopicRelayHandle { publish_tx, local_peer_id }, event_rx))
 }
 
 async fn handle_swarm_event(
@@ -234,7 +296,7 @@ async fn handle_swarm_event(
     swarm: &mut Swarm<TopicBehaviour>,
     event: SwarmEvent<TopicBehaviourEvent>,
     tor_only: bool,
-    seen_txs: &mut HashSet<bitcoin::Txid>,
+    seen_txs: Arc<Mutex<HashSet<bitcoin::Txid>>>,
     event_tx: &mpsc::Sender<TopicEvent>,
     observer_only: bool,
     show_remote: bool,
@@ -250,24 +312,32 @@ async fn handle_swarm_event(
                 let txid = decode_transaction_bytes(&message.data)
                     .map(|tx| tx.compute_txid().to_string())
                     .unwrap_or_else(|_| hex::encode(&message.data));
-                if observer_only {
-                    observe_topic_tx(label, &message.data, tor_only, seen_txs).await?;
-                } else {
-                    handle_topic_tx(label, &message.data, tor_only, seen_txs).await?;
-                }
-                let _ = event_tx.send(TopicEvent::Message { txid }).await;
+                let _ = event_tx.try_send(TopicEvent::Message { txid: txid.clone() });
+                let data = message.data.clone();
+                let label = label.to_string();
+                let seen = seen_txs.clone();
+                tokio::spawn(async move {
+                    let mut guard = seen.lock().await;
+                    if let Err(err) = if observer_only {
+                        observe_topic_tx(&label, &data, tor_only, &mut guard).await
+                    } else {
+                        handle_topic_tx(&label, &data, tor_only, &mut guard).await
+                    } {
+                        warn!(%label, %txid, error = %err, "failed to process received topic tx");
+                    }
+                });
             }
         }
         SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
             if show_remote {
                 info!(%label, ?peer_id, %topic, "peer subscribed to bitcoin-pigeon");
-                let _ = event_tx.send(TopicEvent::Subscribed { peer_id: peer_id.to_string() }).await;
+                let _ = event_tx.try_send(TopicEvent::Subscribed { peer_id: peer_id.to_string() });
             }
         }
         SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
             if show_remote {
                 info!(%label, ?peer_id, %topic, "peer unsubscribed from bitcoin-pigeon");
-                let _ = event_tx.send(TopicEvent::Unsubscribed { peer_id: peer_id.to_string() }).await;
+                let _ = event_tx.try_send(TopicEvent::Unsubscribed { peer_id: peer_id.to_string() });
             }
         }
         SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::GossipsubNotSupported { peer_id })) => {
@@ -293,10 +363,10 @@ async fn handle_swarm_event(
         SwarmEvent::Behaviour(TopicBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
             if show_remote {
                 info!(%label, ?peer_id, agent_version = %info.agent_version, "identified peer");
-                let _ = event_tx.send(TopicEvent::Identified {
+                let _ = event_tx.try_send(TopicEvent::Identified {
                     peer_id: peer_id.to_string(),
                     agent_version: info.agent_version,
-                }).await;
+                });
             }
         }
         SwarmEvent::Behaviour(TopicBehaviourEvent::Identify(event)) => {
@@ -312,10 +382,10 @@ async fn handle_swarm_event(
                     if let Err(err) = swarm.dial(addr.clone()) {
                         warn!(%label, ?peer_id, ?addr, "failed to dial discovered peer: {err}");
                     }
-                    let _ = event_tx.send(TopicEvent::PeerDiscovered {
+                    let _ = event_tx.try_send(TopicEvent::PeerDiscovered {
                         peer_id: peer_id.to_string(),
                         addr: addr.to_string(),
-                    }).await;
+                    });
                 }
             }
         }
@@ -324,17 +394,17 @@ async fn handle_swarm_event(
                 for (peer_id, addr) in list {
                     info!(%label, ?peer_id, ?addr, "mdns expired peer");
                     swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                    let _ = event_tx.send(TopicEvent::PeerExpired {
+                    let _ = event_tx.try_send(TopicEvent::PeerExpired {
                         peer_id: peer_id.to_string(),
-                    }).await;
+                    });
                 }
             }
         }
         SwarmEvent::NewListenAddr { address, .. } => {
             info!(%label, ?address, "listening for bitcoin-pigeon peers");
-            let _ = event_tx.send(TopicEvent::Listening {
+            let _ = event_tx.try_send(TopicEvent::Listening {
                 address: address.to_string(),
-            }).await;
+            });
         }
         other => {
             if show_remote {
@@ -350,7 +420,7 @@ pub(crate) fn build_topic_swarm(
 ) -> Result<(Swarm<TopicBehaviour>, gossipsub::IdentTopic)> {
     let peer_topic_name = BITCOIN_PIGEON_TOPIC.to_owned();
     let gossipsub_config =
-        build_gossipsub_config(config.protocol, config.protocol_version, peer_topic_name.clone())?;
+        build_gossipsub_config(config.protocol, config.protocol_version, config.flood_publish, peer_topic_name.clone())?;
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -365,9 +435,9 @@ pub(crate) fn build_topic_swarm(
         .with_behaviour(move |keypair, relay_client| {
             let peer_id = keypair.public().to_peer_id();
             debug!("peer_id={}", peer_id);
-            let config = gossipsub_config.clone();
+            let gossip_config = gossipsub_config.clone();
 
-            let gossipsub = gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, config)
+            let gossipsub = gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, gossip_config)
                 .map_err(|e| anyhow::anyhow!("failed to build gossipsub behaviour: {e}"))?;
             let identify = identify::Behaviour::new(identify::Config::new(
                 "bitcoin-pigeon/0.1.0".to_string(),
@@ -376,10 +446,18 @@ pub(crate) fn build_topic_swarm(
             let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
             let dcutr = dcutr::Behaviour::new(peer_id);
 
+            let mdns = if config.mdns {
+                Toggle::from(Some(
+                    mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+                        .map_err(|e| anyhow::anyhow!("failed to build mdns behaviour: {e}"))?,
+                ))
+            } else {
+                Toggle::from(None)
+            };
+
             Ok(TopicBehaviour {
                 gossipsub,
-                mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
-                    .map_err(|e| anyhow::anyhow!("failed to build mdns behaviour: {e}"))?,
+                mdns,
                 relay_client,
                 relay_server: relay::Behaviour::new(peer_id, relay::Config::default()),
                 identify,
@@ -414,10 +492,12 @@ pub(crate) fn build_topic_swarm(
 fn build_gossipsub_config(
     protocol: Option<String>,
     protocol_version: Option<String>,
+    flood_publish: bool,
     topic_name: String,
 ) -> Result<gossipsub::Config> {
     let mut config = gossipsub::ConfigBuilder::default();
     config.validation_mode(gossipsub::ValidationMode::Anonymous);
+    config.flood_publish(flood_publish);
     config.message_id_fn(move |message: &gossipsub::Message| {
         tx_message_id(message, &topic_name)
     });
@@ -540,9 +620,7 @@ async fn publish_topic_tx(
     swarm: &mut Swarm<TopicBehaviour>,
     topic: &gossipsub::IdentTopic,
     tx_hex: String,
-    tor_only: bool,
-    seen_txs: &mut HashSet<bitcoin::Txid>,
-) -> Result<()> {
+) -> Result<(bitcoin::Txid, Vec<u8>)> {
     let tx = decode_transaction_hex(&tx_hex)?;
     let txid = tx.compute_txid();
     let raw_bytes = hex::decode(&tx_hex).context("failed to decode transaction hex")?;
@@ -557,7 +635,7 @@ async fn publish_topic_tx(
         );
     }
 
-    handle_topic_tx(label, &raw_bytes, tor_only, seen_txs).await
+    Ok((txid, raw_bytes))
 }
 
 async fn publish_with_retry(
