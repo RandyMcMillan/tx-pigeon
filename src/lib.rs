@@ -437,10 +437,8 @@ async fn discover_libre_peers_from_seeds(
     let mut seed_addrs = Vec::new();
     let mut seed_tasks = JoinSet::new();
 
-    for seed_host in seeds {
-        info!("fetching addrs from {:?}", seed_host);
-
-        let host = seed_host.to_owned();
+    for host in seeds.iter().map(|s| s.to_string()) {
+        info!("fetching addrs from {:?}", host);
 
         seed_tasks.spawn(async move {
             let lookup = lookup_host(format!("{}:8333", host));
