@@ -55,9 +55,10 @@ fn emit_log(log: &Option<LogSink>, message: impl Into<String>) {
     }
 }
 
-fn tor_only_enabled() -> bool {
-    TOR_ONLY.load(Ordering::SeqCst)
-}
+// Disabled: tor_only is now passed explicitly; kept for reference.
+// fn tor_only_enabled() -> bool {
+//     TOR_ONLY.load(Ordering::SeqCst)
+// }
 
 fn now_utc_integer() -> u64 {
     SystemTime::now()
