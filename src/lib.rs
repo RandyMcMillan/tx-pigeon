@@ -126,7 +126,7 @@ pub async fn blast_transaction_hex(
 
 pub async fn blast_transaction(
     tx: Transaction,
-    _tor_only: bool,
+    tor_only: bool,
     relay: bool,
     log: Option<LogSink>,
 ) -> Result<usize> {
@@ -147,7 +147,7 @@ pub async fn blast_transaction(
 
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_DELIVERIES));
 
-    let libre_peers = filter_peers_for_tor_only(libre_peers);
+    let libre_peers = filter_peers_for_tor_only(libre_peers, tor_only);
     emit_log(
         &log,
         format!("TxPigeon: {} peers remain after Tor filtering", libre_peers.len()),
@@ -167,7 +167,7 @@ pub async fn blast_transaction(
 
     let mut poop_delivery_tasks = JoinSet::new();
     for peer_addr in libre_peers.clone() {
-        if tor_only_enabled() && matches!(peer_addr, NetworkAddress::Ip(_)) {
+        if skip_clearnet_in_tor_only(&peer_addr, tor_only) {
             debug!("[TX {txid}] tor-only enabled; skipping clearnet peer {:?}", peer_addr);
             emit_log(
                 &log,
@@ -249,7 +249,7 @@ pub async fn fetch_transactions(limit: usize, tor_only: bool, relay: bool) -> Re
     info!("time to fetch some nodes with pigeon poop! 🐦💩");
     info!("requesting transactions from libre relay peers...");
 
-    let libre_peers = filter_peers_for_tor_only(libre_peers);
+    let libre_peers = filter_peers_for_tor_only(libre_peers, tor_only);
     info!("using {} peers after tor-only filtering", libre_peers.len());
 
     info!("Bootstrapping Tor client...");
@@ -269,7 +269,7 @@ pub async fn fetch_transactions(limit: usize, tor_only: bool, relay: bool) -> Re
         let prefs = prefs.clone();
         peer_tasks.spawn(async move {
             let _permit_guard = permit;
-            fetch_peer_transactions(peer_addr, tor_client, prefs, relay, limit, None).await
+            fetch_peer_transactions(peer_addr, tor_client, prefs, relay, limit, tor_only, None).await
         });
     }
 
@@ -540,8 +540,11 @@ mod tests {
     }
 }
 
-fn filter_peers_for_tor_only(peers: HashSet<NetworkAddress>) -> HashSet<NetworkAddress> {
-    if tor_only_enabled() {
+fn filter_peers_for_tor_only(
+    peers: HashSet<NetworkAddress>,
+    tor_only: bool,
+) -> HashSet<NetworkAddress> {
+    if tor_only {
         info!("Tor-only mode enabled; filtering clearnet peers");
         peers
             .into_iter()
@@ -552,15 +555,20 @@ fn filter_peers_for_tor_only(peers: HashSet<NetworkAddress>) -> HashSet<NetworkA
     }
 }
 
+fn skip_clearnet_in_tor_only(addr: &NetworkAddress, tor_only: bool) -> bool {
+    tor_only && matches!(addr, NetworkAddress::Ip(_))
+}
+
 async fn fetch_peer_transactions(
     addr: NetworkAddress,
     tor_client: Arc<TorClient<PreferredRuntime>>,
     prefs: StreamPrefs,
     relay: bool,
     limit: usize,
+    tor_only: bool,
     log: Option<LogSink>,
 ) -> Result<Vec<Transaction>> {
-    if tor_only_enabled() && matches!(addr, NetworkAddress::Ip(_)) {
+    if skip_clearnet_in_tor_only(&addr, tor_only) {
         debug!("[FETCH] tor-only enabled; skipping {:?}", addr);
         emit_log(&log, format!("TxPigeon: skipping clearnet fetch peer {:?}", addr));
         return Ok(Vec::new());
@@ -795,11 +803,12 @@ async fn deliver_poop_tx(
     tor_client: Arc<TorClient<PreferredRuntime>>,
     prefs: StreamPrefs,
     relay: bool,
+    tor_only: bool,
     log: Option<LogSink>,
 ) -> Result<bool> {
     let txid = tx.compute_txid();
 
-    if tor_only_enabled() && matches!(addr, NetworkAddress::Ip(_)) {
+    if skip_clearnet_in_tor_only(&addr, tor_only) {
         debug!("[TX {txid}] tor-only enabled; skipping {:?}", addr);
         emit_log(&log, format!("TxPigeon: skipping clearnet relay peer {:?} for {txid}", addr));
         return Ok(false);
