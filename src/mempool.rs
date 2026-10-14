@@ -17,28 +17,16 @@ struct MempoolRecentTx {
     txid: String,
 }
 
-pub async fn fetch_recent_txids(limit: usize) -> Result<Vec<String>> {
+pub async fn fetch_recent_txids(limit: usize, tor_only: bool) -> Result<Vec<String>> {
     let clearnet_client = Client::builder()
         .timeout(Duration::from_secs(20))
         .build()?;
     let tor_client = build_tor_client().ok();
 
-    info!(
-        source = "mempool.space",
-        url = MEMPOOL_RECENT_URL,
-        limit,
-        "requesting recent mempool txids"
-    );
-    info!(
-        source = "bitcoin.gob.sv",
-        url = BITCOIN_GOB_SV_RECENT_URL,
-        limit,
-        "requesting recent mempool txids"
-    );
-    let clearnet_fut = fetch_from_source(&clearnet_client, MEMPOOL_RECENT_URL, "mempool.space");
-    let gob_sv_fut =
-        fetch_from_source(&clearnet_client, BITCOIN_GOB_SV_RECENT_URL, "bitcoin.gob.sv");
-    let onion_fut = async {
+    let mut merged = Vec::new();
+    let mut seen = HashSet::new();
+
+    if tor_only {
         match tor_client.as_ref() {
             Some(client) => {
                 info!(
@@ -47,25 +35,55 @@ pub async fn fetch_recent_txids(limit: usize) -> Result<Vec<String>> {
                     limit,
                     "requesting recent mempool txids"
                 );
-                Some(fetch_from_source(client, MEMPOOL_ONION_URL, "mempool onion").await)
+                let onion_result = fetch_from_source(client, MEMPOOL_ONION_URL, "mempool onion").await;
+                merge_recent("mempool onion", onion_result, limit, &mut seen, &mut merged);
             }
-            None => None,
+            None => {
+                debug!("mempool onion fetch skipped because no Tor SOCKS proxy was available");
+            }
         }
-    };
-
-    let (clearnet_result, gob_sv_result, onion_result) =
-        tokio::join!(clearnet_fut, gob_sv_fut, onion_fut);
-
-    let mut merged = Vec::new();
-    let mut seen = HashSet::new();
-
-    merge_recent("mempool.space", clearnet_result, limit, &mut seen, &mut merged);
-    merge_recent("bitcoin.gob.sv", gob_sv_result, limit, &mut seen, &mut merged);
-
-    if let Some(onion_result) = onion_result {
-        merge_recent("mempool onion", onion_result, limit, &mut seen, &mut merged);
     } else {
-        debug!("mempool onion fetch skipped because no Tor SOCKS proxy was available");
+        info!(
+            source = "mempool.space",
+            url = MEMPOOL_RECENT_URL,
+            limit,
+            "requesting recent mempool txids"
+        );
+        info!(
+            source = "bitcoin.gob.sv",
+            url = BITCOIN_GOB_SV_RECENT_URL,
+            limit,
+            "requesting recent mempool txids"
+        );
+        let clearnet_fut = fetch_from_source(&clearnet_client, MEMPOOL_RECENT_URL, "mempool.space");
+        let gob_sv_fut =
+            fetch_from_source(&clearnet_client, BITCOIN_GOB_SV_RECENT_URL, "bitcoin.gob.sv");
+        let onion_fut = async {
+            match tor_client.as_ref() {
+                Some(client) => {
+                    info!(
+                        source = "mempool onion",
+                        url = MEMPOOL_ONION_URL,
+                        limit,
+                        "requesting recent mempool txids"
+                    );
+                    Some(fetch_from_source(client, MEMPOOL_ONION_URL, "mempool onion").await)
+                }
+                None => None,
+            }
+        };
+
+        let (clearnet_result, gob_sv_result, onion_result) =
+            tokio::join!(clearnet_fut, gob_sv_fut, onion_fut);
+
+        merge_recent("mempool.space", clearnet_result, limit, &mut seen, &mut merged);
+        merge_recent("bitcoin.gob.sv", gob_sv_result, limit, &mut seen, &mut merged);
+
+        if let Some(onion_result) = onion_result {
+            merge_recent("mempool onion", onion_result, limit, &mut seen, &mut merged);
+        } else {
+            debug!("mempool onion fetch skipped because no Tor SOCKS proxy was available");
+        }
     }
 
     info!(
@@ -76,8 +94,8 @@ pub async fn fetch_recent_txids(limit: usize) -> Result<Vec<String>> {
     Ok(merged)
 }
 
-pub async fn fetch_recent_tx_hexes(limit: usize) -> Result<Vec<(String, String)>> {
-    let txids = fetch_recent_txids(limit).await?;
+pub async fn fetch_recent_tx_hexes(limit: usize, tor_only: bool) -> Result<Vec<(String, String)>> {
+    let txids = fetch_recent_txids(limit, tor_only).await?;
     let clearnet_client = Client::builder()
         .timeout(Duration::from_secs(20))
         .build()?;
@@ -85,15 +103,29 @@ pub async fn fetch_recent_tx_hexes(limit: usize) -> Result<Vec<(String, String)>
     let mut txs = Vec::new();
 
     for txid in txids {
-        match fetch_tx_hex(&clearnet_client, &txid, MEMPOOL_TX_HEX_URL, "mempool.space").await {
-            Ok(tx_hex) => txs.push((txid, tx_hex)),
-            Err(err) => {
-                warn!(txid = %txid, error = %err, "clearnet tx hex fetch failed");
-                if let Some(client) = tor_client.as_ref() {
-                    match fetch_tx_hex(client, &txid, MEMPOOL_ONION_TX_HEX_URL, "mempool onion").await {
-                        Ok(tx_hex) => txs.push((txid, tx_hex)),
-                        Err(onion_err) => {
-                            debug!(txid = %txid, error = %onion_err, "optional onion tx hex fetch failed");
+        if tor_only {
+            match tor_client.as_ref() {
+                Some(client) => match fetch_tx_hex(client, &txid, MEMPOOL_ONION_TX_HEX_URL, "mempool onion").await {
+                    Ok(tx_hex) => txs.push((txid, tx_hex)),
+                    Err(onion_err) => {
+                        debug!(txid = %txid, error = %onion_err, "optional onion tx hex fetch failed");
+                    }
+                },
+                None => {
+                    debug!(txid = %txid, "skipping onion tx hex fetch because no Tor SOCKS proxy was available");
+                }
+            }
+        } else {
+            match fetch_tx_hex(&clearnet_client, &txid, MEMPOOL_TX_HEX_URL, "mempool.space").await {
+                Ok(tx_hex) => txs.push((txid, tx_hex)),
+                Err(err) => {
+                    warn!(txid = %txid, error = %err, "clearnet tx hex fetch failed");
+                    if let Some(client) = tor_client.as_ref() {
+                        match fetch_tx_hex(client, &txid, MEMPOOL_ONION_TX_HEX_URL, "mempool onion").await {
+                            Ok(tx_hex) => txs.push((txid, tx_hex)),
+                            Err(onion_err) => {
+                                debug!(txid = %txid, error = %onion_err, "optional onion tx hex fetch failed");
+                            }
                         }
                     }
                 }
