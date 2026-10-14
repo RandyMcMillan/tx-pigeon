@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use bitcoin::{Transaction, consensus::Decodable, io::Cursor};
 use futures::StreamExt;
 use libp2p::{
-    Multiaddr, Swarm, SwarmBuilder, autonat, dcutr, gossipsub, mdns, relay,
+    Multiaddr, Swarm, SwarmBuilder, autonat, dcutr, gossipsub, identify, mdns, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
 };
 use sha3::{Digest, Sha3_256};
@@ -18,13 +18,50 @@ use crate::blast_transaction_hex;
 const BITCOIN_PIGEON_TOPIC: &str = "bitcoin-pigeon";
 const DEFAULT_PROTOCOL_PREFIX: &str = "/gnostr";
 const DEFAULT_PROTOCOL_VERSION: &str = "0.0.1";
+const TOPIC_LISTEN_ADDR: &str = "/ip4/0.0.0.0/tcp/0";
+
+/// Events emitted by a topic node for consumption by callers (including FFI).
+#[derive(Debug, Clone)]
+pub enum TopicEvent {
+    Message { txid: String },
+    Subscribed { peer_id: String },
+    Unsubscribed { peer_id: String },
+    PeerDiscovered { peer_id: String, addr: String },
+    PeerExpired { peer_id: String },
+    Listening { address: String },
+    Identified { peer_id: String, agent_version: String },
+}
+
+/// Configuration for building a topic swarm.
+#[derive(Debug, Clone)]
+pub struct TopicConfig {
+    pub bootstrap_peers: Vec<Multiaddr>,
+    pub listen_addr: Multiaddr,
+    pub relay_server: bool,
+    pub protocol: Option<String>,
+    pub protocol_version: Option<String>,
+}
+
+impl Default for TopicConfig {
+    fn default() -> Self {
+        Self {
+            bootstrap_peers: Vec::new(),
+            listen_addr: TOPIC_LISTEN_ADDR.parse().expect("valid multiaddr"),
+            relay_server: true,
+            protocol: None,
+            protocol_version: None,
+        }
+    }
+}
 
 #[derive(NetworkBehaviour)]
 #[behaviour(prelude = "libp2p::swarm::derive_prelude")]
-struct TopicBehaviour {
+pub(crate) struct TopicBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
     relay_client: relay::client::Behaviour,
+    relay_server: relay::Behaviour,
+    identify: identify::Behaviour,
     autonat: autonat::Behaviour,
     dcutr: dcutr::Behaviour,
 }
@@ -35,61 +72,33 @@ pub async fn run_topic_network(
     protocol: Option<String>,
     protocol_version: Option<String>,
 ) -> Result<()> {
-    let (mut swarm, topic) = build_topic_swarm(protocol, protocol_version)?;
+    let config = TopicConfig {
+        protocol,
+        protocol_version,
+        ..TopicConfig::default()
+    };
+    let (mut swarm, topic) = build_topic_swarm(config)?;
     let mut seen_txs = HashSet::new();
+    let (event_tx, _) = mpsc::channel::<TopicEvent>(256);
+
     if let Some(tx_hex) = tx_hex {
         publish_topic_tx("topic-cli", &mut swarm, &topic, tx_hex, tor_only, &mut seen_txs).await?;
     }
 
     loop {
         tokio::select! {
-            event = swarm.select_next_some() => match event {
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                    propagation_source,
-                    message_id,
-                    message,
-                })) => {
-                    info!(?propagation_source, %message_id, "received bitcoin-pigeon topic message");
-                    handle_topic_tx("topic-cli", &message.data, tor_only, &mut seen_txs).await?;
-                }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
-                    info!(?peer_id, %topic, "peer subscribed to bitcoin-pigeon");
-                }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
-                    info!(?peer_id, %topic, "peer unsubscribed from bitcoin-pigeon");
-                }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::GossipsubNotSupported { peer_id })) => {
-                    warn!(?peer_id, "peer does not support gossipsub");
-                }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::RelayClient(event)) => {
-                    info!(?event, "relay client event");
-                }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Autonat(event)) => {
-                    info!(?event, "autonat event");
-                }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Dcutr(event)) => {
-                    info!(?event, "hole punch event");
-                }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                    for (peer_id, addr) in list {
-                        info!(?peer_id, ?addr, "mdns discovered peer");
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                        if let Err(err) = swarm.dial(addr.clone()) {
-                            warn!(?peer_id, ?addr, "failed to dial discovered peer: {err}");
-                        }
-                    }
-                }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
-                    for (peer_id, addr) in list {
-                        info!(?peer_id, ?addr, "mdns expired peer");
-                        swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                    }
-                }
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    info!(?address, "listening for bitcoin-pigeon peers");
-                }
-                other => {
-                    info!(?other, "swarm event");
+            event = swarm.select_next_some() => {
+                if let Err(err) = handle_swarm_event(
+                    "topic-cli",
+                    &mut swarm,
+                    event,
+                    tor_only,
+                    &mut seen_txs,
+                    &event_tx,
+                    false,
+                    true,
+                ).await {
+                    warn!(error = %err, "failed to handle swarm event");
                 }
             },
             _ = signal::ctrl_c() => {
@@ -113,8 +122,14 @@ pub async fn run_gossip_client(
     protocol_version: Option<String>,
 ) -> Result<()> {
     let label = label.into();
-    let (mut swarm, _topic) = build_topic_swarm(protocol, protocol_version)?;
+    let config = TopicConfig {
+        protocol,
+        protocol_version,
+        ..TopicConfig::default()
+    };
+    let (mut swarm, _topic) = build_topic_swarm(config)?;
     let mut seen_txs = HashSet::new();
+    let (event_tx, _) = mpsc::channel::<TopicEvent>(256);
     let mut mempool_tick = interval(Duration::from_secs(10));
 
     info!(
@@ -126,54 +141,18 @@ pub async fn run_gossip_client(
 
     loop {
         tokio::select! {
-            event = swarm.select_next_some() => match event {
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                    propagation_source,
-                    message_id,
-                    message,
-                })) if show_remote => {
-                    let txid = decode_transaction_bytes(&message.data)
-                        .map(|tx| tx.compute_txid().to_string())
-                        .unwrap_or_else(|_| hex::encode(&message.data));
-                    info!(%label, ?propagation_source, %message_id, %txid, "gossip client observed bitcoin-pigeon message");
-                    if let Err(err) = observe_topic_tx(&label, &message.data, tor_only, &mut seen_txs).await {
-                        warn!(error = %err, "failed to observe topic tx");
-                    }
-                }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) if show_remote => {
-                    info!(%label, ?peer_id, %topic, "gossip client subscribed");
-                }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::RelayClient(event)) if show_remote => {
-                    info!(%label, ?event, "gossip client relay event");
-                }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Autonat(event)) if show_remote => {
-                    info!(%label, ?event, "gossip client autonat event");
-                }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Dcutr(event)) if show_remote => {
-                    info!(%label, ?event, "gossip client hole punch event");
-                }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Discovered(list))) if show_remote => {
-                    for (peer_id, addr) in list {
-                        debug!(%label, ?peer_id, ?addr, "gossip client discovered peer");
-                        swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                        if let Err(err) = swarm.dial(addr.clone()) {
-                            warn!(?peer_id, ?addr, "gossip client failed to dial discovered peer: {err}");
-                        }
-                    }
-                }
-                SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Expired(list))) if show_remote => {
-                    for (peer_id, addr) in list {
-                        info!(%label, ?peer_id, ?addr, "gossip client expired peer");
-                        swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                    }
-                }
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    info!(%label, ?address, "gossip client listening for bitcoin-pigeon peers");
-                }
-                other => {
-                    if show_remote {
-                        info!(%label, ?other, "gossip client swarm event");
-                    }
+            event = swarm.select_next_some() => {
+                if let Err(err) = handle_swarm_event(
+                    &label,
+                    &mut swarm,
+                    event,
+                    tor_only,
+                    &mut seen_txs,
+                    &event_tx,
+                    true,
+                    show_remote,
+                ).await {
+                    warn!(%label, error = %err, "failed to handle swarm event");
                 }
             },
             _ = mempool_tick.tick(), if show_local => {
@@ -208,69 +187,29 @@ impl TopicRelayHandle {
 pub async fn spawn_topic_network(
     label: impl Into<String>,
     tor_only: bool,
-    protocol: Option<String>,
-    protocol_version: Option<String>,
-) -> Result<TopicRelayHandle> {
+    config: TopicConfig,
+) -> Result<(TopicRelayHandle, mpsc::Receiver<TopicEvent>)> {
     let label = label.into();
-    let (mut swarm, topic) = build_topic_swarm(protocol, protocol_version)?;
+    let (mut swarm, topic) = build_topic_swarm(config)?;
     let (publish_tx, mut publish_rx) = mpsc::channel::<String>(64);
+    let (event_tx, event_rx) = mpsc::channel::<TopicEvent>(256);
     let mut seen_txs = HashSet::new();
 
     tokio::spawn(async move {
         loop {
             tokio::select! {
-                event = swarm.select_next_some() => match event {
-                    SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Message {
-                        propagation_source,
-                        message_id,
-                        message,
-                    })) => {
-                        let txid = decode_transaction_bytes(&message.data)
-                            .map(|tx| tx.compute_txid().to_string())
-                            .unwrap_or_else(|_| hex::encode(&message.data));
-                        info!(%label, ?propagation_source, %message_id, %txid, "received bitcoin-pigeon topic message");
-                        if let Err(err) = handle_topic_tx(&label, &message.data, tor_only, &mut seen_txs).await {
-                            warn!(error = %err, "failed to handle topic tx");
-                        }
-                    }
-                    SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
-                        info!(?peer_id, %topic, "peer subscribed to bitcoin-pigeon");
-                    }
-                    SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
-                        info!(?peer_id, %topic, "peer unsubscribed from bitcoin-pigeon");
-                    }
-                    SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::GossipsubNotSupported { peer_id })) => {
-                        warn!(?peer_id, "peer does not support gossipsub");
-                    }
-                    SwarmEvent::Behaviour(TopicBehaviourEvent::RelayClient(event)) => {
-                        info!(%label, ?event, "gossip client relay event");
-                    }
-                    SwarmEvent::Behaviour(TopicBehaviourEvent::Autonat(event)) => {
-                        info!(%label, ?event, "gossip client autonat event");
-                    }
-                    SwarmEvent::Behaviour(TopicBehaviourEvent::Dcutr(event)) => {
-                        info!(%label, ?event, "gossip client hole punch event");
-                    }
-                    SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
-                        for (peer_id, addr) in list {
-                            info!(%label, ?peer_id, ?addr, "mdns discovered peer");
-                            swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                            if let Err(err) = swarm.dial(addr.clone()) {
-                                warn!(?peer_id, ?addr, "failed to dial discovered peer: {err}");
-                            }
-                        }
-                    }
-                    SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
-                        for (peer_id, addr) in list {
-                            info!(%label, ?peer_id, ?addr, "mdns expired peer");
-                            swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
-                        }
-                    }
-                    SwarmEvent::NewListenAddr { address, .. } => {
-                        info!(%label, ?address, "listening for bitcoin-pigeon peers");
-                    }
-                    other => {
-                        info!(%label, ?other, "swarm event");
+                event = swarm.select_next_some() => {
+                    if let Err(err) = handle_swarm_event(
+                        &label,
+                        &mut swarm,
+                        event,
+                        tor_only,
+                        &mut seen_txs,
+                        &event_tx,
+                        false,
+                        true,
+                    ).await {
+                        warn!(error = %err, "failed to handle swarm event");
                     }
                 },
                 maybe_tx_hex = publish_rx.recv() => {
@@ -287,16 +226,131 @@ pub async fn spawn_topic_network(
         }
     });
 
-    Ok(TopicRelayHandle { publish_tx })
+    Ok((TopicRelayHandle { publish_tx }, event_rx))
 }
 
-fn build_topic_swarm(
-    protocol: Option<String>,
-    protocol_version: Option<String>,
+async fn handle_swarm_event(
+    label: &str,
+    swarm: &mut Swarm<TopicBehaviour>,
+    event: SwarmEvent<TopicBehaviourEvent>,
+    tor_only: bool,
+    seen_txs: &mut HashSet<bitcoin::Txid>,
+    event_tx: &mpsc::Sender<TopicEvent>,
+    observer_only: bool,
+    show_remote: bool,
+) -> Result<()> {
+    match event {
+        SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+            propagation_source,
+            message_id,
+            message,
+        })) => {
+            if show_remote {
+                info!(%label, ?propagation_source, %message_id, "received bitcoin-pigeon topic message");
+                let txid = decode_transaction_bytes(&message.data)
+                    .map(|tx| tx.compute_txid().to_string())
+                    .unwrap_or_else(|_| hex::encode(&message.data));
+                if observer_only {
+                    observe_topic_tx(label, &message.data, tor_only, seen_txs).await?;
+                } else {
+                    handle_topic_tx(label, &message.data, tor_only, seen_txs).await?;
+                }
+                let _ = event_tx.send(TopicEvent::Message { txid }).await;
+            }
+        }
+        SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic })) => {
+            if show_remote {
+                info!(%label, ?peer_id, %topic, "peer subscribed to bitcoin-pigeon");
+                let _ = event_tx.send(TopicEvent::Subscribed { peer_id: peer_id.to_string() }).await;
+            }
+        }
+        SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::Unsubscribed { peer_id, topic })) => {
+            if show_remote {
+                info!(%label, ?peer_id, %topic, "peer unsubscribed from bitcoin-pigeon");
+                let _ = event_tx.send(TopicEvent::Unsubscribed { peer_id: peer_id.to_string() }).await;
+            }
+        }
+        SwarmEvent::Behaviour(TopicBehaviourEvent::Gossipsub(gossipsub::Event::GossipsubNotSupported { peer_id })) => {
+            if show_remote {
+                warn!(%label, ?peer_id, "peer does not support gossipsub");
+            }
+        }
+        SwarmEvent::Behaviour(TopicBehaviourEvent::RelayClient(event)) => {
+            if show_remote {
+                info!(%label, ?event, "relay client event");
+            }
+        }
+        SwarmEvent::Behaviour(TopicBehaviourEvent::Autonat(event)) => {
+            if show_remote {
+                info!(%label, ?event, "autonat event");
+            }
+        }
+        SwarmEvent::Behaviour(TopicBehaviourEvent::Dcutr(event)) => {
+            if show_remote {
+                info!(%label, ?event, "hole punch event");
+            }
+        }
+        SwarmEvent::Behaviour(TopicBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
+            if show_remote {
+                info!(%label, ?peer_id, agent_version = %info.agent_version, "identified peer");
+                let _ = event_tx.send(TopicEvent::Identified {
+                    peer_id: peer_id.to_string(),
+                    agent_version: info.agent_version,
+                }).await;
+            }
+        }
+        SwarmEvent::Behaviour(TopicBehaviourEvent::Identify(event)) => {
+            if show_remote {
+                debug!(%label, ?event, "identify event");
+            }
+        }
+        SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+            if show_remote {
+                for (peer_id, addr) in list {
+                    info!(%label, ?peer_id, ?addr, "mdns discovered peer");
+                    swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
+                    if let Err(err) = swarm.dial(addr.clone()) {
+                        warn!(%label, ?peer_id, ?addr, "failed to dial discovered peer: {err}");
+                    }
+                    let _ = event_tx.send(TopicEvent::PeerDiscovered {
+                        peer_id: peer_id.to_string(),
+                        addr: addr.to_string(),
+                    }).await;
+                }
+            }
+        }
+        SwarmEvent::Behaviour(TopicBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+            if show_remote {
+                for (peer_id, addr) in list {
+                    info!(%label, ?peer_id, ?addr, "mdns expired peer");
+                    swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
+                    let _ = event_tx.send(TopicEvent::PeerExpired {
+                        peer_id: peer_id.to_string(),
+                    }).await;
+                }
+            }
+        }
+        SwarmEvent::NewListenAddr { address, .. } => {
+            info!(%label, ?address, "listening for bitcoin-pigeon peers");
+            let _ = event_tx.send(TopicEvent::Listening {
+                address: address.to_string(),
+            }).await;
+        }
+        other => {
+            if show_remote {
+                info!(%label, ?other, "swarm event");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn build_topic_swarm(
+    config: TopicConfig,
 ) -> Result<(Swarm<TopicBehaviour>, gossipsub::IdentTopic)> {
     let peer_topic_name = BITCOIN_PIGEON_TOPIC.to_owned();
     let gossipsub_config =
-        build_gossipsub_config(protocol, protocol_version, peer_topic_name.clone())?;
+        build_gossipsub_config(config.protocol, config.protocol_version, peer_topic_name.clone())?;
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_tcp(
@@ -315,15 +369,20 @@ fn build_topic_swarm(
 
             let gossipsub = gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Anonymous, config)
                 .map_err(|e| anyhow::anyhow!("failed to build gossipsub behaviour: {e}"))?;
-            let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
-                .map_err(|e| anyhow::anyhow!("failed to build mdns behaviour: {e}"))?;
+            let identify = identify::Behaviour::new(identify::Config::new(
+                "bitcoin-pigeon/0.1.0".to_string(),
+                keypair.public(),
+            ));
             let autonat = autonat::Behaviour::new(peer_id, autonat::Config::default());
             let dcutr = dcutr::Behaviour::new(peer_id);
 
             Ok(TopicBehaviour {
                 gossipsub,
-                mdns,
+                mdns: mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+                    .map_err(|e| anyhow::anyhow!("failed to build mdns behaviour: {e}"))?,
                 relay_client,
+                relay_server: relay::Behaviour::new(peer_id, relay::Config::default()),
+                identify,
                 autonat,
                 dcutr,
             })
@@ -338,8 +397,16 @@ fn build_topic_swarm(
         .context("failed to subscribe to bitcoin-pigeon topic")?;
 
     swarm
-        .listen_on("/ip4/0.0.0.0/tcp/0".parse::<Multiaddr>()?)
+        .listen_on(config.listen_addr)
         .context("failed to start listening")?;
+
+    for addr in &config.bootstrap_peers {
+        if let Err(err) = swarm.dial(addr.clone()) {
+            warn!(%addr, "failed to dial bootstrap peer: {err}");
+        } else {
+            info!(%addr, "dialed bootstrap peer");
+        }
+    }
 
     Ok((swarm, topic))
 }
@@ -396,7 +463,10 @@ fn gossipsub_version_for(version: &str) -> gossipsub::Version {
 
 #[cfg(test)]
 mod tests {
-    use super::compose_protocol_id;
+    use super::*;
+    use bitcoin::consensus::Encodable;
+
+    const SAMPLE_TX_HEX: &str = "0100000001c997a5e56e104102fa209c6a852dd90660a20b2d9c352423edce25857fcd3704000000004847304402204e45e16932b8af514961a1d3a1a25fdf3f4f7732e9d624c6c61548ab5fb8cd410220181522ec8eca07de4860a4acdd12909d831cc56cbbac4622082221a8768d1d0901ffffffff0200ca9a3b00000000434104ae1a62fe09c5f51b13905f07f06b99a2f7159b2225f374cd378d71302fa28414e7aab37397f554a7df5f142c21c1b7303b8a0626f1baded5c72a704f7e6cd84cac00286bee0000000043410411db93e1dcdb8a016b49840f8c53bc1eb68a382e97b1482ecad7b148a6909a5cb2e0eaddfb84ccf9744464f82e160bfa9b8b64f9d4c03f999b8643f656b412a3ac00000000";
 
     #[test]
     fn composes_custom_protocol_ids() {
@@ -416,6 +486,52 @@ mod tests {
             compose_protocol_id("/gnostr", "0.0.1"),
             "/gnostr/0.0.1"
         );
+    }
+
+    #[test]
+    fn gossipsub_version_for_maps_versions() {
+        assert!(matches!(gossipsub_version_for("1.1.0"), gossipsub::Version::V1_1));
+        assert!(matches!(gossipsub_version_for("0.0.1"), gossipsub::Version::V1_0));
+        assert!(matches!(gossipsub_version_for("1.0.0"), gossipsub::Version::V1_0));
+    }
+
+    #[test]
+    fn tx_message_id_uses_txid_for_valid_tx() {
+        let data = hex::decode(SAMPLE_TX_HEX).unwrap();
+        let tx = decode_transaction_bytes(&data).unwrap();
+        let topic = gossipsub::IdentTopic::new(BITCOIN_PIGEON_TOPIC);
+        let message = gossipsub::Message {
+            source: None,
+            data,
+            sequence_number: None,
+            topic: topic.hash(),
+        };
+
+        let id = tx_message_id(&message, BITCOIN_PIGEON_TOPIC);
+
+        assert_eq!(id, gossipsub::MessageId::from(tx.compute_txid().to_string()));
+    }
+
+    #[test]
+    fn decode_transaction_hex_and_bytes_round_trip() {
+        let tx = decode_transaction_hex(SAMPLE_TX_HEX).unwrap();
+        let mut bytes = Vec::new();
+        tx.consensus_encode(&mut bytes).unwrap();
+
+        assert_eq!(hex::encode(&bytes).to_lowercase(), SAMPLE_TX_HEX.to_lowercase());
+
+        let tx2 = decode_transaction_bytes(&bytes).unwrap();
+        assert_eq!(tx.compute_txid(), tx2.compute_txid());
+    }
+
+    #[tokio::test]
+    async fn build_topic_swarm_with_default_config_subscribes() {
+        let config = TopicConfig::default();
+        let (swarm, topic) = tokio::task::spawn_blocking(|| build_topic_swarm(config).unwrap())
+            .await
+            .unwrap();
+
+        assert!(swarm.behaviour().gossipsub.topics().any(|t| t == &topic.hash()));
     }
 }
 
