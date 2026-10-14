@@ -105,7 +105,7 @@ pub async fn run() -> Result<()> {
         }
         None => {
             let tx = args.tx.context("missing --tx")?;
-            crate::blast_transaction_hex(&tx, args.tor_only, true).await?;
+            crate::blast_transaction_hex(&tx, args.tor_only, true, None).await?;
         }
     }
 
